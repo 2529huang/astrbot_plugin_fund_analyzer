@@ -1,0 +1,6 @@
+name: astrbot_plugin_fund_analyzer
+description: 基金数据分析插件 - 使用AKShare获取基金实时行情、历史数据和技术分析
+version: 1.0.0
+author: AstrBot
+homepage: https://github.com/astrbot/astrbot_plugin_fund_analyzer
+repo: https://github.com/astrbot/astrbot_plugin_fund_analyzer
