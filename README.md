@@ -194,7 +194,7 @@ astrbot_plugin_fund_analyzer/
 ## 🙏 感谢 & 参考
 
 - [AKShare](https://github.com/akfamily/akshare) - 开源金融数据接口
-- [AstrBot](https://github.com/Soulter/AstrBot) - 多平台 LLM 聊天机器人框架
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot) - 多平台 LLM 聊天机器人框架
 
 ## 📄 开源许可
 

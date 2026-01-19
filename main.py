@@ -394,7 +394,7 @@ class FundAnalyzerPlugin(Star):
         # 延迟初始化 AI 分析器
         self._ai_analyzer = None
         # 获取插件数据目录
-        self._data_dir = Path(StarTools.get_data_dir(context, "fund_analyzer"))
+        self._data_dir = Path(StarTools.get_data_dir("fund_analyzer"))
         self._data_dir.mkdir(parents=True, exist_ok=True)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
