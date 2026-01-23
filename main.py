@@ -1,4 +1,4 @@
-﻿"""
+"""
 AstrBot 基金数据分析插件
 使用 AKShare 开源库获取基金数据，进行分析和展示
 默认分析：国投瑞银白银期货(LOF)A (代码: 161226)
@@ -14,6 +14,9 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
+
+# 导入股票分析模块
+from .stock import StockAnalyzer, StockInfo
 
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
 DEFAULT_TIMEOUT = 120  # 2分钟
@@ -376,6 +379,10 @@ class FundAnalyzer:
         }
 
 
+# 贵金属价格缓存TTL（15分钟）
+METAL_CACHE_TTL = 900
+
+
 @register(
     "astrbot_plugin_fund_analyzer",
     "2529huang",
@@ -391,6 +398,8 @@ class FundAnalyzerPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.analyzer = FundAnalyzer()
+        # 初始化股票分析器
+        self.stock_analyzer = StockAnalyzer()
         # 延迟初始化 AI 分析器
         self._ai_analyzer = None
         # 获取插件数据目录
@@ -398,6 +407,9 @@ class FundAnalyzerPlugin(Star):
         self._data_dir.mkdir(parents=True, exist_ok=True)
         # 加载用户设置
         self.user_fund_settings: dict[str, str] = self._load_user_settings()
+        # 贵金属价格缓存
+        self._metal_cache: dict = {}
+        self._metal_cache_time: datetime | None = None
         # 检查依赖
         self._check_dependencies()
         logger.info("基金分析插件已加载")
@@ -444,6 +456,24 @@ class FundAnalyzerPlugin(Star):
     def _get_user_fund(self, user_id: str) -> str:
         """获取用户设置的默认基金代码"""
         return self.user_fund_settings.get(user_id, FundAnalyzer.DEFAULT_FUND_CODE)
+
+    def _normalize_fund_code(self, code: str | int | None) -> str | None:
+        """标准化基金代码，补齐前导0到6位
+        
+        Args:
+            code: 基金代码，可能是字符串、整数或None
+            
+        Returns:
+            标准化后的6位基金代码字符串，如果输入为None则返回None
+        """
+        if code is None:
+            return None
+        # 转换为字符串并去除空格
+        code_str = str(code).strip()
+        if not code_str:
+            return None
+        # 补齐前导0到6位
+        return code_str.zfill(6)
 
     def _format_fund_info(self, info: FundInfo) -> str:
         """格式化基金信息为文本"""
@@ -529,6 +559,333 @@ class FundAnalyzerPlugin(Star):
 💡 投资建议: 请结合自身风险承受能力谨慎投资
 """.strip()
 
+    def _format_stock_info(self, info: StockInfo) -> str:
+        """格式化A股股票信息为文本"""
+        # 价格为0通常表示暂无数据
+        if info.latest_price == 0:
+            return f"""
+📊 【{info.name}】
+━━━━━━━━━━━━━━━━━
+⚠️ 暂无实时行情数据
+━━━━━━━━━━━━━━━━━
+🔢 股票代码: {info.code}
+💡 可能原因: 停牌/休市/数据源未更新
+⏰ 查询时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+""".strip()
+
+        change_color = (
+            "🔴" if info.change_rate < 0 else "🟢" if info.change_rate > 0 else "⚪"
+        )
+
+        # 格式化市值（转换为亿元）
+        def format_market_cap(value):
+            if value >= 100000000:  # 亿元
+                return f"{value / 100000000:.2f}亿"
+            elif value >= 10000:  # 万元
+                return f"{value / 10000:.2f}万"
+            return f"{value:.2f}"
+
+        return f"""
+📊 【{info.name}】实时行情 {info.trend_emoji}
+━━━━━━━━━━━━━━━━━
+💰 最新价: {info.latest_price:.2f}
+{change_color} 涨跌额: {info.change_amount:+.2f}
+{change_color} 涨跌幅: {info.change_rate:+.2f}%
+📏 振幅: {info.amplitude:.2f}%
+━━━━━━━━━━━━━━━━━
+📈 今开: {info.open_price:.2f}
+📊 最高: {info.high_price:.2f}
+📉 最低: {info.low_price:.2f}
+📋 昨收: {info.prev_close:.2f}
+━━━━━━━━━━━━━━━━━
+📦 成交量: {info.volume:,.0f}手
+💵 成交额: {format_market_cap(info.amount)}
+🔄 换手率: {info.turnover_rate:.2f}%
+━━━━━━━━━━━━━━━━━
+📈 市盈率(动态): {info.pe_ratio:.2f}
+📊 市净率: {info.pb_ratio:.2f}
+💰 总市值: {format_market_cap(info.total_market_cap)}
+💎 流通市值: {format_market_cap(info.circulating_market_cap)}
+━━━━━━━━━━━━━━━━━
+🔢 股票代码: {info.code}
+⏰ 更新时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+💡 数据缓存10分钟，仅供参考
+""".strip()
+
+    async def _fetch_precious_metal_prices(self) -> dict:
+        """
+        从NowAPI获取上海黄金交易所贵金属价格
+        返回包含金价和银价的字典
+        API文档: https://www.nowapi.com/api/finance.shgold
+        黄金使用1301，白银使用1302，需分开调用
+        缓存15分钟
+        """
+        import aiohttp
+
+        # 检查缓存是否有效（15分钟）
+        now = datetime.now()
+        if (
+            self._metal_cache
+            and self._metal_cache_time is not None
+            and (now - self._metal_cache_time).total_seconds() < METAL_CACHE_TTL
+        ):
+            logger.debug("使用贵金属价格缓存")
+            return self._metal_cache
+
+        # NowAPI 接口配置
+        api_url = "http://api.k780.com/"
+        base_params = {
+            "app": "finance.gold_price",
+            "appkey": "78365",
+            "sign": "776f93b557ce6e6afeb860b103a587c7",
+            "format": "json",
+        }
+
+        prices = {}
+
+        async def fetch_metal(gold_id: str, key: str, name: str) -> dict | None:
+            """获取单个金属品种的价格"""
+            params = {**base_params, "goldid": gold_id}
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        api_url, params=params, timeout=aiohttp.ClientTimeout(total=30)
+                    ) as response:
+                        if response.status != 200:
+                            logger.error(f"获取{name}价格失败: HTTP {response.status}")
+                            return None
+
+                        data = await response.json()
+
+                        if data.get("success") != "1":
+                            error_msg = data.get("msg", "未知错误")
+                            logger.error(f"NowAPI返回错误({name}): {error_msg}")
+                            return None
+
+                        result = data.get("result", {})
+                        dt_list = result.get("dtList", {})
+
+                        if gold_id in dt_list:
+                            metal_data = dt_list[gold_id]
+                            return {
+                                "name": metal_data.get("varietynm", name),
+                                "variety": metal_data.get("variety", ""),
+                                "price": float(metal_data.get("last_price", 0) or 0),
+                                "buy_price": float(metal_data.get("buy_price", 0) or 0),
+                                "sell_price": float(
+                                    metal_data.get("sell_price", 0) or 0
+                                ),
+                                "high": float(metal_data.get("high_price", 0) or 0),
+                                "low": float(metal_data.get("low_price", 0) or 0),
+                                "open": float(metal_data.get("open_price", 0) or 0),
+                                "prev_close": float(
+                                    metal_data.get("yesy_price", 0) or 0
+                                ),
+                                "change": float(metal_data.get("change_price", 0) or 0),
+                                "change_rate": metal_data.get("change_margin", "0%"),
+                                "update_time": metal_data.get("uptime", ""),
+                            }
+                        return None
+            except Exception as e:
+                logger.error(f"获取{name}价格出错: {e}")
+                return None
+
+        try:
+            # 分开调用黄金(1301)和白银(1302)
+            gold_data = await fetch_metal("1051", "au_td", "黄金")
+            if gold_data:
+                prices["au_td"] = gold_data
+
+            silver_data = await fetch_metal("1052", "ag_td", "白银")
+            if silver_data:
+                prices["ag_td"] = silver_data
+
+            # 更新缓存
+            if prices:
+                self._metal_cache = prices
+                self._metal_cache_time = now
+                logger.info("贵金属价格已更新并缓存15分钟")
+
+            return prices
+
+        except Exception as e:
+            logger.error(f"获取贵金属价格出错: {e}")
+            # 如果有旧缓存，返回旧数据
+            if self._metal_cache:
+                logger.info("使用过期的贵金属缓存数据")
+                return self._metal_cache
+            return {}
+
+    def _format_precious_metal_prices(self, prices: dict) -> str:
+        """格式化贵金属价格信息"""
+        if not prices:
+            return "❌ 获取贵金属价格失败，请稍后重试"
+
+        def parse_change_rate(rate_str: str) -> float:
+            """解析涨跌幅字符串，如 '1.5%' -> 1.5"""
+            try:
+                return float(rate_str.replace("%", "").replace("+", ""))
+            except (ValueError, AttributeError):
+                return 0.0
+
+        def format_item(data: dict, unit: str = "元/克") -> str:
+            if not data:
+                return "  暂无数据"
+
+            change_rate = parse_change_rate(data.get("change_rate", "0%"))
+            change_emoji = (
+                "🔴" if change_rate < 0 else "🟢" if change_rate > 0 else "⚪"
+            )
+            trend_emoji = "📈" if change_rate > 0 else "📉" if change_rate < 0 else "➡️"
+
+            return f"""  {trend_emoji} 最新价: {data["price"]:.2f} {unit}
+  {change_emoji} 涨跌: {data.get("change", 0):+.2f} ({data.get("change_rate", "0%")})
+  📊 今开: {data.get("open", 0):.2f} | 最高: {data.get("high", 0):.2f} | 最低: {data.get("low", 0):.2f}
+  💹 买入: {data.get("buy_price", 0):.2f} | 卖出: {data.get("sell_price", 0):.2f}"""
+
+        lines = [
+            "💰 今日贵金属行情（国际现货）",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+
+        # 黄金T+D
+        if "au_td" in prices:
+            lines.append("🥇 黄金")
+            lines.append(format_item(prices["au_td"], "美元/盎司"))
+            if prices["au_td"].get("update_time"):
+                lines.append(f"  🕐 更新: {prices['au_td']['update_time']}")
+            lines.append("")
+
+        # 白银T+D
+        if "ag_td" in prices:
+            lines.append("🥈 白银")
+            lines.append(format_item(prices["ag_td"], "美元/盎司"))
+            if prices["ag_td"].get("update_time"):
+                lines.append(f"  🕐 更新: {prices['ag_td']['update_time']}")
+            lines.append("")
+
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("📌 国际现货24小时交易")
+        lines.append("💡 数据来源: NowAPI | 缓存15分钟")
+
+        return "\n".join(lines)
+
+    @filter.command("今日行情")
+    async def today_market(self, event: AstrMessageEvent):
+        """
+        查询今日贵金属行情
+        用法: 今日行情
+        返回国际金价、银价及涨跌幅
+        """
+        try:
+            yield event.plain_result("🔍 正在获取今日贵金属行情...")
+
+            prices = await self._fetch_precious_metal_prices()
+
+            if prices:
+                yield event.plain_result(self._format_precious_metal_prices(prices))
+            else:
+                yield event.plain_result("❌ 获取贵金属行情失败，请稍后重试")
+
+        except Exception as e:
+            logger.error(f"获取今日行情出错: {e}")
+            yield event.plain_result(f"❌ 获取行情失败: {str(e)}")
+
+    @filter.command("股票")
+    async def stock_query(self, event: AstrMessageEvent, code: str = None):
+        """
+        查询A股实时行情
+        用法: 股票 <股票代码>
+        示例: 股票 000001
+        示例: 股票 600519
+        """
+        try:
+            if not code:
+                yield event.plain_result(
+                    "❌ 请输入股票代码\n"
+                    "💡 用法: 股票 <股票代码>\n"
+                    "💡 示例: 股票 000001 (平安银行)\n"
+                    "💡 示例: 股票 600519 (贵州茅台)"
+                )
+                return
+
+            stock_code = str(code).strip()
+            yield event.plain_result(f"🔍 正在查询股票 {stock_code} 的实时行情...")
+
+            info = await self.stock_analyzer.get_stock_realtime(stock_code)
+
+            if info:
+                yield event.plain_result(self._format_stock_info(info))
+            else:
+                yield event.plain_result(
+                    f"❌ 未找到股票代码 {stock_code}\n"
+                    "💡 请使用「搜索股票 关键词」来搜索正确的股票代码\n"
+                    "💡 示例: 搜索股票 茅台"
+                )
+
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"查询股票行情出错: {e}")
+            yield event.plain_result(f"❌ 查询失败: {str(e)}")
+
+    @filter.command("搜索股票")
+    async def search_stock(self, event: AstrMessageEvent, keyword: str = None):
+        """
+        搜索A股股票
+        用法: 搜索股票 <关键词>
+        示例: 搜索股票 茅台
+        """
+        try:
+            if not keyword:
+                yield event.plain_result(
+                    "❌ 请输入搜索关键词\n"
+                    "💡 用法: 搜索股票 <关键词>\n"
+                    "💡 示例: 搜索股票 茅台"
+                )
+                return
+
+            yield event.plain_result(f"🔍 正在搜索包含 '{keyword}' 的股票...")
+
+            results = await self.stock_analyzer.search_stock(keyword)
+
+            if not results:
+                yield event.plain_result(f"❌ 未找到包含 '{keyword}' 的股票")
+                return
+
+            # 格式化搜索结果
+            lines = [f"🔍 搜索结果: '{keyword}'", "━━━━━━━━━━━━━━━━━"]
+            for i, stock in enumerate(results, 1):
+                change_emoji = (
+                    "🔴"
+                    if stock["change_rate"] < 0
+                    else "🟢"
+                    if stock["change_rate"] > 0
+                    else "⚪"
+                )
+                lines.append(
+                    f"{i}. {stock['name']} ({stock['code']})\n"
+                    f"   💰 {stock['price']:.2f} {change_emoji} {stock['change_rate']:+.2f}%"
+                )
+            lines.append("━━━━━━━━━━━━━━━━━")
+            lines.append("💡 使用「股票 代码」查看详细行情")
+
+            yield event.plain_result("\n".join(lines))
+
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"搜索股票出错: {e}")
+            yield event.plain_result(f"❌ 搜索失败: {str(e)}")
+
     @filter.command("基金")
     async def fund_query(self, event: AstrMessageEvent, code: str = None):
         """
@@ -538,7 +895,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            fund_code = code or self._get_user_fund(user_id)
+            # 标准化基金代码，补齐前导0
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
 
             yield event.plain_result(f"🔍 正在查询基金 {fund_code} 的实时行情...")
 
@@ -571,7 +930,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            fund_code = code or self._get_user_fund(user_id)
+            # 标准化基金代码，补齐前导0
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
 
             yield event.plain_result(f"📊 正在分析基金 {fund_code}...")
 
@@ -615,7 +976,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            fund_code = code or self._get_user_fund(user_id)
+            # 标准化基金代码，补齐前导0
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
 
             try:
                 num_days = int(days)
@@ -764,6 +1127,8 @@ class FundAnalyzerPlugin(Star):
             return
 
         try:
+            # 标准化基金代码，补齐前导0
+            code = self._normalize_fund_code(code) or code
             # 验证基金代码是否有效
             info = await self.analyzer.get_lof_realtime(code)
 
@@ -801,7 +1166,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            fund_code = code or self._get_user_fund(user_id)
+            # 标准化基金代码，补齐前导0
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
 
             yield event.plain_result(
                 f"🤖 正在对基金 {fund_code} 进行智能分析...\n"
@@ -899,7 +1266,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            fund_code = code or self._get_user_fund(user_id)
+            # 标准化基金代码，补齐前导0
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
 
             yield event.plain_result(
                 f"📊 正在对基金 {fund_code} 进行量化分析...\n"
@@ -967,8 +1336,16 @@ class FundAnalyzerPlugin(Star):
     async def fund_help(self, event: AstrMessageEvent):
         """显示基金分析插件帮助信息"""
         help_text = """
-📊 基金分析插件帮助
+📊 基金/股票分析插件帮助
 ━━━━━━━━━━━━━━━━━
+� 贵金属行情:
+🔹 今日行情 - 查询金价银价实时行情
+━━━━━━━━━━━━━━━━━
+📈 A股实时行情 (缓存10分钟):
+🔹 股票 <代码> - 查询A股实时行情
+🔹 搜索股票 关键词 - 搜索A股股票
+━━━━━━━━━━━━━━━━━
+📊 LOF基金功能:
 🔹 基金 [代码] - 查询基金实时行情
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 量化分析 [代码] - 📈专业量化指标分析
@@ -982,19 +1359,15 @@ class FundAnalyzerPlugin(Star):
    基金代码: 161226
 ━━━━━━━━━━━━━━━━━
 📈 示例:
+  • 今日行情 (金银价格)
+  • 股票 000001 (平安银行)
+  • 搜索股票 茅台
   • 基金 161226
   • 基金分析
   • 量化分析 161226
   • 智能分析 161226
   • 基金历史 161226 20
   • 搜索基金 白银
-━━━━━━━━━━━━━━━━━
-📊 量化分析功能说明:
-  无需AI，纯数据量化分析:
-  - 绩效指标: 夏普/索提诺/卡玛比率
-  - 风险指标: 最大回撤/VaR/波动率
-  - 技术指标: MACD/RSI/KDJ/布林带
-  - 策略回测: MA交叉/RSI策略
 ━━━━━━━━━━━━━━━━━
 🤖 智能分析功能说明:
   调用AI大模型+量化数据，综合分析:
@@ -1004,7 +1377,8 @@ class FundAnalyzerPlugin(Star):
   - 相关市场动态和新闻
   - 上涨趋势和概率预测
 ━━━━━━━━━━━━━━━━━
-⚠️ 数据来源: AKShare (东方财富)
+⚠️ 数据来源: AKShare/国际金价网
+💡 A股数据缓存10分钟，仅供参考
 💡 投资有风险，入市需谨慎！
 """.strip()
         yield event.plain_result(help_text)
