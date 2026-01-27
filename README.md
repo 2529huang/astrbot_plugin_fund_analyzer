@@ -1,6 +1,6 @@
 # 📊 AstrBot 基金分析插件
 
-![Hits](https://hits.getloli.com/api?url=https://github.com/woniu336/astrbot_plugin_fund_analyzer&title=views&edge_flat=true)
+![astrbot_plugin_fund_analyzer](https://count.getloli.com/@astrbot_plugin_fund_analyzer)
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-green.svg)](https://www.python.org/downloads/)
