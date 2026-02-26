@@ -43,7 +43,7 @@ HEADERS_LIST = [
 ]
 
 # 超时设置
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=15)
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=15, sock_read=20)
 
 
 class EastMoneyAPI:
@@ -62,12 +62,43 @@ class EastMoneyAPI:
     OTC_FUND_API = "https://fundgz.1234567.com.cn/js/{}.js"
     # 场外基金历史净值 API
     OTC_HISTORY_API = "https://api.fund.eastmoney.com/f10/lsjz"
+    # 备用数据源 - 腾讯财经（当东方财富push2系列API被封锁时自动切换）
+    TENCENT_QUOTE_API = "https://qt.gtimg.cn/q="
+    TENCENT_KLINE_API = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    # 备用数据源 - 新浪财经
+    SINA_QUOTE_API = "https://hq.sinajs.cn/list="
 
     def __init__(self):
         # 缓存
         self._lof_list_cache: Optional[list] = None
         self._lof_cache_time: Optional[datetime] = None
         self._cache_ttl = 1800  # 30分钟缓存
+        # 持久化 session（复用连接，减少 Server disconnected）
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建持久化 HTTP session（复用TCP连接）"""
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(
+                ssl=False,
+                limit=10,  # 最大连接数
+                limit_per_host=5,
+                ttl_dns_cache=300,  # DNS缓存5分钟
+                keepalive_timeout=30,  # keep-alive 30秒
+                enable_cleanup_closed=True,
+            )
+            self._session = aiohttp.ClientSession(
+                timeout=REQUEST_TIMEOUT,
+                connector=connector,
+                trust_env=False,  # 忽略系统代理
+            )
+        return self._session
+
+    async def close(self):
+        """关闭持久化 session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def _request(
         self,
@@ -77,6 +108,8 @@ class EastMoneyAPI:
     ) -> Optional[dict]:
         """
         发送 HTTP 请求，带重试机制
+        
+        优化：使用持久化session复用TCP连接，避免频繁建立/断开导致Server disconnected
         
         Args:
             url: API 地址
@@ -91,40 +124,36 @@ class EastMoneyAPI:
                 # 随机选择请求头
                 headers = random.choice(HEADERS_LIST)
                 
-                # 创建 connector，禁用代理
-                connector = aiohttp.TCPConnector(
-                    ssl=False,
-                    force_close=True,
-                    enable_cleanup_closed=True,
-                )
+                session = await self._get_session()
                 
-                async with aiohttp.ClientSession(
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    connector=connector,
-                    trust_env=False,  # 忽略系统代理设置
-                ) as session:
-                    async with session.get(url, params=params) as response:
-                        if response.status == 200:
-                            # 有些 API 返回 text/plain，需要手动解析 JSON
-                            text = await response.text()
-                            try:
-                                return json.loads(text)
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"JSON 解析失败: {e}")
-                                return None
-                        else:
-                            logger.warning(f"HTTP {response.status}: {url}")
+                async with session.get(url, params=params, headers=headers) as response:
+                    if response.status == 200:
+                        # 有些 API 返回 text/plain，需要手动解析 JSON
+                        text = await response.text()
+                        try:
+                            return json.loads(text)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"JSON 解析失败: {e}")
+                            return None
+                    else:
+                        logger.warning(f"HTTP {response.status}: {url}")
+            except aiohttp.ServerDisconnectedError:
+                # 服务器断开连接，关闭旧session重建
+                logger.warning(f"服务器断开连接 (第{attempt + 1}次): {url}，正在重建连接...")
+                await self.close()
             except asyncio.TimeoutError:
                 logger.warning(f"请求超时 (第{attempt + 1}次): {url}")
             except aiohttp.ClientError as e:
                 logger.warning(f"请求失败 (第{attempt + 1}次): {e}")
+                # 连接相关错误，重建session
+                if "disconnect" in str(e).lower() or "connection" in str(e).lower():
+                    await self.close()
             except Exception as e:
                 logger.error(f"请求异常: {e}")
             
-            # 重试前等待（逐渐增加等待时间）
+            # 重试前短暂等待（首次快速重试，后续逐渐增加）
             if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 3 + random.uniform(0, 2)
+                wait_time = (attempt + 1) * 1.5 + random.uniform(0, 1)
                 await asyncio.sleep(wait_time)
         
         return None
@@ -213,98 +242,197 @@ class EastMoneyAPI:
         for attempt in range(3):
             try:
                 headers = random.choice(HEADERS_LIST)
-                connector = aiohttp.TCPConnector(ssl=False, force_close=True)
+                session = await self._get_session()
                 
-                async with aiohttp.ClientSession(
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    connector=connector,
-                    trust_env=False,
-                ) as session:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            text = await response.text()
-                            # 解析 JSONP: jsonpgz({...})
-                            match = re.search(r'jsonpgz\((.*)\)', text)
-                            if match:
-                                data = json.loads(match.group(1))
-                                
-                                def safe_float(val):
-                                    if val is None or val == "":
-                                        return 0.0
-                                    try:
-                                        return float(val)
-                                    except (ValueError, TypeError):
-                                        return 0.0
-                                
-                                return {
-                                    "code": data.get("fundcode", fund_code),
-                                    "name": data.get("name", ""),
-                                    "latest_price": safe_float(data.get("gsz")),  # 估算净值
-                                    "prev_close": safe_float(data.get("dwjz")),  # 昨日净值
-                                    "change_rate": safe_float(data.get("gszzl")),  # 估算涨跌幅
-                                    "change_amount": 0.0,
-                                    "update_time": data.get("gztime", ""),
-                                    "is_otc": True,  # 标记为场外基金
-                                }
-                        elif response.status == 404:
-                            # 基金不存在
-                            return None
+                async with session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        # 解析 JSONP: jsonpgz({...})
+                        match = re.search(r'jsonpgz\((.*)\)', text)
+                        if match:
+                            data = json.loads(match.group(1))
+                            
+                            def safe_float(val):
+                                if val is None or val == "":
+                                    return 0.0
+                                try:
+                                    return float(val)
+                                except (ValueError, TypeError):
+                                    return 0.0
+                            
+                            return {
+                                "code": data.get("fundcode", fund_code),
+                                "name": data.get("name", ""),
+                                "latest_price": safe_float(data.get("gsz")),  # 估算净值
+                                "prev_close": safe_float(data.get("dwjz")),  # 昨日净值
+                                "change_rate": safe_float(data.get("gszzl")),  # 估算涨跌幅
+                                "change_amount": 0.0,
+                                "update_time": data.get("gztime", ""),
+                                "is_otc": True,  # 标记为场外基金
+                            }
+                    elif response.status == 404:
+                        # 基金不存在
+                        return None
+            except aiohttp.ServerDisconnectedError:
+                logger.warning(f"场外基金估值服务器断开 (第{attempt + 1}次): {fund_code}")
+                await self.close()
             except Exception as e:
                 logger.debug(f"获取场外基金估值失败 (第{attempt + 1}次): {e}")
             
             if attempt < 2:
-                await asyncio.sleep((attempt + 1) * 2)
+                await asyncio.sleep((attempt + 1) * 1.5)
         
         return None
 
     async def _get_exchange_fund_realtime(self, fund_code: str) -> Optional[dict]:
         """
         获取场内基金（ETF/LOF）实时行情
-        
-        Args:
-            fund_code: 基金代码
-            
-        Returns:
-            行情数据字典或 None
+        依次尝试：东方财富 → 腾讯财经 → 新浪财经 → 天天基金估值
         """
         market = self._get_market_code(fund_code)
         
+        # === 1. 东方财富主源 ===
         params = {
             "secid": f"{market}.{fund_code}",
             "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170",
         }
         
         data = await self._request(self.QUOTE_API, params)
-        if not data or data.get("rc") != 0:
-            return None
+        if data and data.get("rc") == 0:
+            result = data.get("data", {})
+            if result:
+                def safe_float(val, divisor=1):
+                    if val is None or val == "-":
+                        return 0.0
+                    try:
+                        return float(val) / divisor
+                    except (ValueError, TypeError):
+                        return 0.0
+                
+                return {
+                    "code": str(result.get("f57", fund_code)),
+                    "name": str(result.get("f58", "")),
+                    "latest_price": safe_float(result.get("f43"), 1000),
+                    "change_amount": safe_float(result.get("f169"), 1000),
+                    "change_rate": safe_float(result.get("f170"), 100),
+                    "open_price": safe_float(result.get("f46"), 1000),
+                    "high_price": safe_float(result.get("f44"), 1000),
+                    "low_price": safe_float(result.get("f45"), 1000),
+                    "prev_close": safe_float(result.get("f60"), 1000),
+                    "volume": safe_float(result.get("f47")),
+                    "amount": safe_float(result.get("f48")),
+                    "turnover_rate": safe_float(result.get("f168"), 100),
+                }
         
-        result = data.get("data", {})
-        if not result:
-            return None
+        # === 2. 腾讯财经备用源 ===
+        logger.debug(f"东方财富获取失败，尝试腾讯财经: {fund_code}")
+        result = await self._get_exchange_realtime_tencent(fund_code)
+        if result:
+            return result
         
-        def safe_float(val, divisor=1):
-            if val is None or val == "-":
-                return 0.0
-            try:
-                return float(val) / divisor
-            except (ValueError, TypeError):
-                return 0.0
+        # === 3. 新浪财经备用源 ===
+        logger.debug(f"腾讯财经获取失败，尝试新浪财经: {fund_code}")
+        result = await self._get_exchange_realtime_sina(fund_code)
+        if result:
+            return result
         
-        return {
-            "code": str(result.get("f57", fund_code)),
-            "name": str(result.get("f58", "")),
-            "latest_price": safe_float(result.get("f43"), 1000),
-            "change_amount": safe_float(result.get("f169"), 1000),
-            "change_rate": safe_float(result.get("f170"), 100),
-            "open_price": safe_float(result.get("f46"), 1000),
-            "high_price": safe_float(result.get("f44"), 1000),
-            "low_price": safe_float(result.get("f45"), 1000),
-            "prev_close": safe_float(result.get("f60"), 1000),
-            "volume": safe_float(result.get("f47")),
-            "amount": safe_float(result.get("f48")),
-            "turnover_rate": safe_float(result.get("f168"), 100),
-        }
+        # === 4. 天天基金 API（部分ETF也有天天基金页面） ===
+        logger.debug(f"所有场内数据源失败，尝试天天基金: {fund_code}")
+        return await self._get_otc_fund_realtime(fund_code)
+
+    async def _get_exchange_realtime_tencent(self, fund_code: str) -> Optional[dict]:
+        """腾讯财经备用源 - 获取场内基金实时行情"""
+        market_prefix = "sh" if fund_code.startswith(("5", "6")) else "sz"
+        url = f"{self.TENCENT_QUOTE_API}{market_prefix}{fund_code}"
+        
+        try:
+            session = await self._get_session()
+            headers = {"User-Agent": random.choice(HEADERS_LIST)["User-Agent"]}
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                text = await response.text(encoding="gbk")
+                match = re.search(r'"(.+)"', text)
+                if not match:
+                    return None
+                parts = match.group(1).split("~")
+                if len(parts) < 38:
+                    return None
+                
+                def sf(val):
+                    try:
+                        return float(val) if val and val.strip() else 0.0
+                    except (ValueError, TypeError):
+                        return 0.0
+                
+                return {
+                    "code": fund_code,
+                    "name": parts[1],
+                    "latest_price": sf(parts[3]),
+                    "prev_close": sf(parts[4]),
+                    "open_price": sf(parts[5]),
+                    "volume": sf(parts[6]) * 100,  # 手→股
+                    "change_amount": sf(parts[31]),
+                    "change_rate": sf(parts[32]),
+                    "high_price": sf(parts[33]),
+                    "low_price": sf(parts[34]),
+                    "amount": sf(parts[37]) * 10000,  # 万→元
+                    "turnover_rate": sf(parts[38]) if len(parts) > 38 else 0.0,
+                }
+        except Exception as e:
+            logger.debug(f"腾讯财经获取失败: {fund_code} - {e}")
+        return None
+
+    async def _get_exchange_realtime_sina(self, fund_code: str) -> Optional[dict]:
+        """新浪财经备用源 - 获取场内基金实时行情"""
+        market_prefix = "sh" if fund_code.startswith(("5", "6")) else "sz"
+        url = f"{self.SINA_QUOTE_API}{market_prefix}{fund_code}"
+        
+        try:
+            session = await self._get_session()
+            headers = {
+                "User-Agent": random.choice(HEADERS_LIST)["User-Agent"],
+                "Referer": "https://finance.sina.com.cn/",
+            }
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return None
+                text = await response.text(encoding="gbk")
+                match = re.search(r'"(.+)"', text)
+                if not match:
+                    return None
+                parts = match.group(1).split(",")
+                if len(parts) < 10:
+                    return None
+                
+                def sf(val):
+                    try:
+                        return float(val) if val and val.strip() else 0.0
+                    except (ValueError, TypeError):
+                        return 0.0
+                
+                current = sf(parts[3])
+                prev_close = sf(parts[2])
+                change_amount = round(current - prev_close, 4) if current and prev_close else 0.0
+                change_rate = round(change_amount / prev_close * 100, 2) if prev_close else 0.0
+                
+                return {
+                    "code": fund_code,
+                    "name": parts[0],
+                    "latest_price": current,
+                    "prev_close": prev_close,
+                    "open_price": sf(parts[1]),
+                    "high_price": sf(parts[4]),
+                    "low_price": sf(parts[5]),
+                    "volume": sf(parts[8]),
+                    "amount": sf(parts[9]),
+                    "change_amount": change_amount,
+                    "change_rate": change_rate,
+                    "turnover_rate": 0.0,
+                }
+        except Exception as e:
+            logger.debug(f"新浪财经获取失败: {fund_code} - {e}")
+        return None
 
     async def get_fund_history(
         self,
@@ -359,64 +487,63 @@ class EastMoneyAPI:
         
         for attempt in range(3):
             try:
-                connector = aiohttp.TCPConnector(ssl=False, force_close=True)
+                session = await self._get_session()
                 
-                async with aiohttp.ClientSession(
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    connector=connector,
-                    trust_env=False,
-                ) as session:
-                    async with session.get(self.OTC_HISTORY_API, params=params) as response:
-                        if response.status == 200:
-                            text = await response.text()
-                            data = json.loads(text)
+                async with session.get(
+                    self.OTC_HISTORY_API, params=params, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        data = json.loads(text)
+                        
+                        if data.get("ErrCode") != 0:
+                            logger.warning(f"获取场外基金历史失败: {data.get('ErrMsg')}")
+                            return None
+                        
+                        lsjz_list = data.get("Data", {}).get("LSJZList", [])
+                        if not lsjz_list:
+                            return None
+                        
+                        history = []
+                        prev_close = None
+                        
+                        # 倒序处理（API返回的是从新到旧）
+                        for item in reversed(lsjz_list):
+                            def safe_float(val):
+                                if val is None or val == "" or val == "--":
+                                    return 0.0
+                                try:
+                                    return float(val)
+                                except (ValueError, TypeError):
+                                    return 0.0
                             
-                            if data.get("ErrCode") != 0:
-                                logger.warning(f"获取场外基金历史失败: {data.get('ErrMsg')}")
-                                return None
+                            close = safe_float(item.get("DWJZ"))
                             
-                            lsjz_list = data.get("Data", {}).get("LSJZList", [])
-                            if not lsjz_list:
-                                return None
+                            # 计算涨跌幅
+                            change_rate = 0.0
+                            jzzzl = item.get("JZZZL")
+                            if jzzzl and jzzzl != "--":
+                                change_rate = safe_float(jzzzl)
+                            elif prev_close and prev_close > 0:
+                                change_rate = (close - prev_close) / prev_close * 100
                             
-                            history = []
-                            prev_close = None
+                            history.append({
+                                "date": item.get("FSRQ", ""),
+                                "open": close,  # 场外基金没有开盘价
+                                "close": close,
+                                "high": close,
+                                "low": close,
+                                "volume": 0.0,
+                                "amount": 0.0,
+                                "change_rate": change_rate,
+                            })
                             
-                            # 倒序处理（API返回的是从新到旧）
-                            for item in reversed(lsjz_list):
-                                def safe_float(val):
-                                    if val is None or val == "" or val == "--":
-                                        return 0.0
-                                    try:
-                                        return float(val)
-                                    except (ValueError, TypeError):
-                                        return 0.0
-                                
-                                close = safe_float(item.get("DWJZ"))
-                                
-                                # 计算涨跌幅
-                                change_rate = 0.0
-                                jzzzl = item.get("JZZZL")
-                                if jzzzl and jzzzl != "--":
-                                    change_rate = safe_float(jzzzl)
-                                elif prev_close and prev_close > 0:
-                                    change_rate = (close - prev_close) / prev_close * 100
-                                
-                                history.append({
-                                    "date": item.get("FSRQ", ""),
-                                    "open": close,  # 场外基金没有开盘价
-                                    "close": close,
-                                    "high": close,
-                                    "low": close,
-                                    "volume": 0.0,
-                                    "amount": 0.0,
-                                    "change_rate": change_rate,
-                                })
-                                
-                                prev_close = close
-                            
-                            return history
+                            prev_close = close
+                        
+                        return history
+            except aiohttp.ServerDisconnectedError:
+                logger.warning(f"场外基金历史服务器断开 (第{attempt + 1}次): {fund_code}")
+                await self.close()
             except Exception as e:
                 logger.debug(f"获取场外基金历史失败 (第{attempt + 1}次): {e}")
             
@@ -464,39 +591,111 @@ class EastMoneyAPI:
         }
         
         data = await self._request(self.KLINE_API, params)
-        if not data or data.get("rc") != 0:
-            logger.error(f"获取历史数据失败: {fund_code}")
-            return None
+        if data and data.get("rc") == 0:
+            result = data.get("data", {})
+            klines = result.get("klines", [])
+            
+            if klines:
+                history = []
+                for line in klines:
+                    # 格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+                    parts = line.split(",")
+                    if len(parts) >= 11:
+                        try:
+                            history.append({
+                                "date": parts[0],
+                                "open": float(parts[1]),
+                                "close": float(parts[2]),
+                                "high": float(parts[3]),
+                                "low": float(parts[4]),
+                                "volume": float(parts[5]),
+                                "amount": float(parts[6]),
+                                "change_rate": float(parts[8]) if parts[8] else 0.0,
+                            })
+                        except (ValueError, IndexError) as e:
+                            logger.debug(f"解析K线数据失败: {line}, 错误: {e}")
+                            continue
+                
+                if history:
+                    return history[-days:] if len(history) > days else history
         
-        result = data.get("data", {})
-        klines = result.get("klines", [])
+        # === 备用源: 腾讯财经K线 ===
+        logger.debug(f"东方财富K线获取失败，尝试腾讯财经: {fund_code}")
+        result = await self._get_exchange_history_tencent(fund_code, days)
+        if result:
+            return result
         
-        if not klines:
-            logger.warning(f"未找到历史数据: {fund_code}")
-            return None
+        # === 备用源: 场外基金历史净值 API ===
+        logger.debug(f"腾讯K线获取失败，尝试场外基金历史API: {fund_code}")
+        return await self._get_otc_fund_history(fund_code, days)
+
+    async def _get_exchange_history_tencent(
+        self,
+        fund_code: str,
+        days: int = 30,
+    ) -> Optional[list]:
+        """腾讯财经备用源 - 获取场内基金历史K线"""
+        market_prefix = "sh" if fund_code.startswith(("5", "6")) else "sz"
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days * 2 + 30)
         
-        history = []
-        for line in klines:
-            # 格式: 日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-            parts = line.split(",")
-            if len(parts) >= 11:
-                try:
-                    history.append({
-                        "date": parts[0],
-                        "open": float(parts[1]),
-                        "close": float(parts[2]),
-                        "high": float(parts[3]),
-                        "low": float(parts[4]),
-                        "volume": float(parts[5]),
-                        "amount": float(parts[6]),
-                        "change_rate": float(parts[8]) if parts[8] else 0.0,
-                    })
-                except (ValueError, IndexError) as e:
-                    logger.debug(f"解析K线数据失败: {line}, 错误: {e}")
-                    continue
+        params = {
+            "param": f"{market_prefix}{fund_code},day,{start_date.strftime('%Y-%m-%d')},,{days * 2},qfq",
+        }
         
-        # 只返回最近 N 天
-        return history[-days:] if len(history) > days else history
+        try:
+            session = await self._get_session()
+            headers = {"User-Agent": random.choice(HEADERS_LIST)["User-Agent"]}
+            
+            async with session.get(
+                self.TENCENT_KLINE_API, params=params, headers=headers
+            ) as response:
+                if response.status != 200:
+                    return None
+                text = await response.text()
+                data = json.loads(text)
+                
+                if data.get("code") != 0:
+                    return None
+                
+                stock_data = data.get("data", {}).get(f"{market_prefix}{fund_code}", {})
+                
+                # 优先取前复权数据
+                klines = stock_data.get("qfqday") or stock_data.get("day", [])
+                if not klines:
+                    return None
+                
+                history = []
+                prev_close = None
+                for line in klines:
+                    if len(line) < 6:
+                        continue
+                    try:
+                        close = float(line[2])
+                        change_rate = 0.0
+                        if prev_close and prev_close > 0:
+                            change_rate = round(
+                                (close - prev_close) / prev_close * 100, 2
+                            )
+                        
+                        history.append({
+                            "date": line[0],
+                            "open": float(line[1]),
+                            "close": close,
+                            "high": float(line[3]),
+                            "low": float(line[4]),
+                            "volume": float(line[5]),
+                            "amount": 0.0,
+                            "change_rate": change_rate,
+                        })
+                        prev_close = close
+                    except (ValueError, IndexError):
+                        continue
+                
+                return history[-days:] if len(history) > days else history
+        except Exception as e:
+            logger.debug(f"腾讯K线获取失败: {fund_code} - {e}")
+        return None
 
     async def get_lof_list(self, use_cache: bool = True) -> Optional[list]:
         """
@@ -603,6 +802,22 @@ class EastMoneyAPI:
             return []
         
         datas = data.get("Datas", [])
+        
+        # 如果搜索API返回空结果（服务器IP可能被限制），尝试直接获取实时数据
+        if not datas and keyword.isdigit() and len(keyword) == 6:
+            logger.debug(f"搜索API返回空结果，尝试直接获取实时数据: {keyword}")
+            realtime = await self.get_fund_realtime(keyword)
+            if realtime and realtime.get("name"):
+                return [{
+                    "code": keyword,
+                    "name": realtime.get("name", ""),
+                    "fund_type": "",
+                    "latest_price": realtime.get("latest_price", 0.0),
+                    "change_rate": realtime.get("change_rate", 0.0),
+                    "change_amount": realtime.get("change_amount", 0.0),
+                }]
+            return []
+        
         if not datas:
             return []
         
@@ -668,8 +883,9 @@ class EastMoneyAPI:
         realtime_results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for i, realtime in enumerate(realtime_results):
-            if isinstance(realtime, Exception) or realtime is None:
+            if isinstance(realtime, BaseException) or realtime is None:
                 continue
+            assert isinstance(realtime, dict)
             
             fund = fund_list[i]
             # 更新实时数据
