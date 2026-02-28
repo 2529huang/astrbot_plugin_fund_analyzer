@@ -1,6 +1,7 @@
 name: astrbot_plugin_fund_analyzer
-description: 基金数据分析插件 - 提供实时行情、技术分析、量化指标、策略回测、AI智能分析
-version: 1.1.1
+display_name: 基金/股票智能分析
+description: AI 多智能体博弈 + 量化分析 —— 支持股票多智能体辩论分析、AI 智能量化分析、实时行情、技术分析、量化指标等
+version: 2.0.0
 author: 2529huang
 homepage: https://github.com/2529huang/astrbot_plugin_fund_analyzer
 repo: https://github.com/2529huang/astrbot_plugin_fund_analyzer
