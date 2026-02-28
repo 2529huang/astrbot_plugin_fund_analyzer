@@ -67,6 +67,10 @@ class EastMoneyAPI:
     TENCENT_KLINE_API = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     # 备用数据源 - 新浪财经
     SINA_QUOTE_API = "https://hq.sinajs.cn/list="
+    # 资金流向 API (场内)
+    FUND_FLOW_API = "http://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    # 资金流向备用源 - 东方财富 datacenter
+    FUND_FLOW_DETAIL_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
     def __init__(self):
         # 缓存
@@ -896,6 +900,233 @@ class EastMoneyAPI:
             if realtime.get("change_amount") is not None:
                 fund["change_amount"] = realtime["change_amount"]
     
+    async def get_fund_flow(
+        self, fund_code: str, days: int = 10
+    ) -> Optional[list[dict]]:
+        """
+        获取基金/股票资金流向数据（主力净流入等）
+        
+        依次尝试：东方财富push2 → 东方财富datacenter
+        仅场内基金有资金流向数据，场外基金返回 None
+        
+        Args:
+            fund_code: 基金代码（场内ETF/LOF/股票）
+            days: 获取天数
+            
+        Returns:
+            资金流向数据列表或 None，每条包含：
+            date, main_net_inflow（主力净流入），
+            super_large_inflow（超大单净流入），large_inflow（大单净流入），
+            medium_inflow（中单净流入），small_inflow（小单净流入）
+        """
+        fund_code = str(fund_code).strip()
+        
+        # 场外基金无资金流向数据
+        if self._is_otc_fund(fund_code):
+            return None
+        
+        # === 1. 东方财富 push2 主源 ===
+        result = await self._get_fund_flow_eastmoney(fund_code, days)
+        if result:
+            return result
+        
+        # === 2. 东方财富 datacenter 备用源 ===
+        logger.debug(f"push2资金流向获取失败，尝试datacenter: {fund_code}")
+        result = await self._get_fund_flow_datacenter(fund_code, days)
+        if result:
+            return result
+        
+        logger.warning(f"所有资金流向数据源均失败: {fund_code}")
+        return None
+    
+    async def _get_fund_flow_eastmoney(
+        self, fund_code: str, days: int = 10
+    ) -> Optional[list[dict]]:
+        """东方财富 push2 资金流向 API"""
+        market = self._get_market_code(fund_code)
+        
+        params = {
+            "lmt": str(days),
+            "klt": "101",  # 日K
+            "secid": f"{market}.{fund_code}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        }
+        
+        data = await self._request(self.FUND_FLOW_API, params)
+        if not data or data.get("rc") != 0:
+            return None
+        
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return None
+        
+        flow_list = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 7:
+                continue
+            try:
+                flow_list.append({
+                    "date": parts[0],
+                    "main_net_inflow": float(parts[1]),      # 主力净流入
+                    "small_inflow": float(parts[2]),          # 小单净流入
+                    "medium_inflow": float(parts[3]),         # 中单净流入
+                    "large_inflow": float(parts[4]),          # 大单净流入
+                    "super_large_inflow": float(parts[5]),    # 超大单净流入
+                })
+            except (ValueError, IndexError):
+                continue
+        
+        return flow_list if flow_list else None
+    
+    async def _get_fund_flow_datacenter(
+        self, fund_code: str, days: int = 10
+    ) -> Optional[list[dict]]:
+        """东方财富 datacenter 资金流向备用 API"""
+        market = self._get_market_code(fund_code)
+        market_name = "上海" if market == "1" else "深圳"
+        
+        params = {
+            "reportName": "RPT_STOCK_FFLOW_DAYKLINE",
+            "columns": "ALL",
+            "filter": f'(SECURITY_CODE="{fund_code}")(MARKET="{market_name}")',
+            "pageNumber": "1",
+            "pageSize": str(days),
+            "sortTypes": "-1",
+            "sortColumns": "TRADE_DATE",
+            "source": "WEB",
+            "client": "WEB",
+        }
+        
+        try:
+            session = await self._get_session()
+            headers = {
+                "User-Agent": random.choice(HEADERS_LIST)["User-Agent"],
+                "Referer": "https://data.eastmoney.com/",
+            }
+            
+            async with session.get(
+                self.FUND_FLOW_DETAIL_API, params=params, headers=headers
+            ) as response:
+                if response.status != 200:
+                    return None
+                text = await response.text()
+                data = json.loads(text)
+                
+                if not data.get("success"):
+                    return None
+                
+                items = data.get("result", {}).get("data", [])
+                if not items:
+                    return None
+                
+                flow_list = []
+                for item in reversed(items):  # 倒序，从旧到新
+                    def sf(val):
+                        if val is None:
+                            return 0.0
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            return 0.0
+                    
+                    trade_date = item.get("TRADE_DATE", "")
+                    if trade_date and len(trade_date) >= 10:
+                        trade_date = trade_date[:10]  # "2025-01-02T00:00:00" → "2025-01-02"
+                    
+                    flow_list.append({
+                        "date": trade_date,
+                        "main_net_inflow": sf(item.get("MAIN_NET_INFLOW")),
+                        "small_inflow": sf(item.get("SMALL_NET_INFLOW")),
+                        "medium_inflow": sf(item.get("MIDDLE_NET_INFLOW")),
+                        "large_inflow": sf(item.get("LARGE_NET_INFLOW")),
+                        "super_large_inflow": sf(item.get("SUPER_LARGE_NET_INFLOW")),
+                    })
+                
+                return flow_list if flow_list else None
+        except Exception as e:
+            logger.debug(f"datacenter资金流向获取失败: {fund_code} - {e}")
+        return None
+    
+    def format_fund_flow_text(self, flow_data: Optional[list[dict]]) -> str:
+        """
+        格式化资金流向数据为文本
+        
+        Args:
+            flow_data: get_fund_flow 返回的数据
+            
+        Returns:
+            格式化文本
+        """
+        if not flow_data:
+            return "暂无资金流向数据（场外基金或数据源不可用）"
+        
+        lines = []
+        total_main = 0.0
+        total_super = 0.0
+        total_large = 0.0
+        positive_days = 0
+        
+        lines.append("| 日期 | 主力净流入 | 超大单 | 大单 | 中单 | 小单 |")
+        lines.append("|------|-----------|--------|------|------|------|")
+        
+        for item in flow_data[-10:]:  # 最多显示10天
+            date = item["date"]
+            main = item["main_net_inflow"]
+            super_l = item["super_large_inflow"]
+            large = item["large_inflow"]
+            medium = item["medium_inflow"]
+            small = item["small_inflow"]
+            
+            total_main += main
+            total_super += super_l
+            total_large += large
+            if main > 0:
+                positive_days += 1
+            
+            def fmt(val):
+                if abs(val) >= 1e8:
+                    return f"{val/1e8:+.2f}亿"
+                elif abs(val) >= 1e4:
+                    return f"{val/1e4:+.2f}万"
+                else:
+                    return f"{val:+.0f}"
+            
+            lines.append(
+                f"| {date} | {fmt(main)} | {fmt(super_l)} | {fmt(large)} | {fmt(medium)} | {fmt(small)} |"
+            )
+        
+        # 汇总统计
+        n = len(flow_data[-10:])
+        lines.append("")
+        lines.append(f"**近{n}日汇总**：")
+        
+        def fmt_summary(val):
+            if abs(val) >= 1e8:
+                return f"{val/1e8:+.2f}亿"
+            elif abs(val) >= 1e4:
+                return f"{val/1e4:+.2f}万"
+            else:
+                return f"{val:+.0f}"
+        
+        lines.append(f"- 主力累计净流入: {fmt_summary(total_main)}")
+        lines.append(f"- 超大单累计净流入: {fmt_summary(total_super)}")
+        lines.append(f"- 大单累计净流入: {fmt_summary(total_large)}")
+        lines.append(f"- 主力净流入天数: {positive_days}/{n}天")
+        
+        # 趋势判断
+        if n >= 3:
+            recent_3 = flow_data[-3:]
+            recent_trend = sum(d["main_net_inflow"] for d in recent_3)
+            if recent_trend > 0:
+                lines.append(f"- 近3日趋势: 主力资金净流入 {fmt_summary(recent_trend)} 🔺")
+            else:
+                lines.append(f"- 近3日趋势: 主力资金净流出 {fmt_summary(recent_trend)} 🔻")
+        
+        return "\n".join(lines)
+
     async def validate_fund_code(self, fund_code: str) -> bool:
         """
         验证基金代码是否有效

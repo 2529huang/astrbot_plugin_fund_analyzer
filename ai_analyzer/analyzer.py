@@ -93,15 +93,17 @@ class AIFundAnalyzer:
         history_data: list[dict],
         technical_indicators: dict[str, Any],
         user_id: str,
+        fund_flow_text: str = "",
     ) -> str:
         """
-        执行 AI 智能分析（含量化数据）
+        执行 AI 智能分析（含量化数据和资金流向）
 
         Args:
             fund_info: 基金信息对象
             history_data: 历史数据列表
             technical_indicators: 技术指标（旧版，保留兼容性）
             user_id: 用户 ID
+            fund_flow_text: 资金流向数据文本
 
         Returns:
             分析结果文本
@@ -138,7 +140,7 @@ class AIFundAnalyzer:
         # 7. 获取新闻摘要（含国际形势）
         news_summary = await self.get_news_summary(fund_info.name, fund_info.code)
 
-        # 8. 构建分析提示词（使用新模板，含国际形势）
+        # 8. 构建分析提示词（使用新模板，含国际形势和资金流向）
         analysis_prompt = self._build_quant_analysis_prompt(
             fund_info=fund_info,
             performance_summary=performance_summary,
@@ -148,6 +150,7 @@ class AIFundAnalyzer:
             history_summary=history_summary,
             news_summary=news_summary,
             global_situation_text=global_situation_text,
+            fund_flow_text=fund_flow_text,
         )
 
         # 9. 调用大模型分析
@@ -169,8 +172,9 @@ class AIFundAnalyzer:
         history_summary: str,
         news_summary: str,
         global_situation_text: str = "",
+        fund_flow_text: str = "",
     ) -> str:
-        """构建包含量化数据和国际形势的分析提示词"""
+        """构建包含量化数据、国际形势和资金流向的分析提示词"""
         from .prompts import ANALYSIS_PROMPT_TEMPLATE
 
         return ANALYSIS_PROMPT_TEMPLATE.format(
@@ -193,6 +197,9 @@ class AIFundAnalyzer:
             global_situation_text=global_situation_text
             if global_situation_text
             else "暂无国际形势分析",
+            fund_flow_text=fund_flow_text
+            if fund_flow_text
+            else "暂无资金流向数据",
             history_summary=history_summary if history_summary else "暂无数据",
             news_summary=news_summary if news_summary else "暂无相关新闻",
         )

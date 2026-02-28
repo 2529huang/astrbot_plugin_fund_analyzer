@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多智能体博弈分析报告</title>
+  <style>
+    html {
+      width: fit-content;
+    }
+
+    body {
+      font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      margin: 0;
+      padding: 0;
+      color: #333;
+      background-color: transparent;
+      display: inline-block;
+      width: fit-content;
+    }
+
+    .container {
+      background-color: #ffffff;
+      width: 520px;
+      overflow: hidden;
+      box-sizing: border-box;
+      border-radius: 0;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #722ed1 0%, #eb2f96 100%);
+      color: white;
+      padding: 18px 15px;
+      text-align: center;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+    }
+
+    .header p {
+      margin: 4px 0 0;
+      opacity: 0.9;
+      font-size: 13px;
+    }
+
+    .verdict-section {
+      padding: 18px 15px;
+      text-align: center;
+      border-bottom: 2px solid #f0f0f0;
+      background: linear-gradient(180deg, #fafafa 0%, #fff 100%);
+    }
+
+    .verdict-direction {
+      font-size: 32px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+
+    .verdict-direction.bullish {
+      color: #cf1322;
+    }
+
+    .verdict-direction.bearish {
+      color: #389e0d;
+    }
+
+    .verdict-direction.neutral {
+      color: #d48806;
+    }
+
+    .confidence-bar {
+      width: 80%;
+      margin: 10px auto;
+      height: 10px;
+      background-color: #f0f0f0;
+      border-radius: 5px;
+      overflow: hidden;
+    }
+
+    .confidence-fill {
+      height: 100%;
+      border-radius: 5px;
+      transition: width 0.5s;
+    }
+
+    .confidence-fill.bullish {
+      background: linear-gradient(90deg, #ff7875, #cf1322);
+    }
+
+    .confidence-fill.bearish {
+      background: linear-gradient(90deg, #95de64, #389e0d);
+    }
+
+    .confidence-fill.neutral {
+      background: linear-gradient(90deg, #ffd666, #d48806);
+    }
+
+    .confidence-text {
+      font-size: 14px;
+      color: #666;
+      margin-top: 5px;
+    }
+
+    .bull-bear-bar {
+      display: flex;
+      width: 80%;
+      margin: 12px auto 0;
+      height: 24px;
+      border-radius: 12px;
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .bull-bar {
+      background: linear-gradient(90deg, #ff7875, #cf1322);
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .bear-bar {
+      background: linear-gradient(90deg, #389e0d, #95de64);
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .agents-grid {
+      display: flex;
+      flex-wrap: wrap;
+      padding: 10px;
+      gap: 8px;
+    }
+
+    .agent-card {
+      flex: 1 1 calc(50% - 8px);
+      min-width: calc(50% - 8px);
+      border: 1px solid #f0f0f0;
+      border-radius: 8px;
+      padding: 10px;
+      background: #fafafa;
+      box-sizing: border-box;
+    }
+
+    .agent-card-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .agent-card-header .emoji {
+      font-size: 18px;
+    }
+
+    .agent-card-header .name {
+      font-size: 13px;
+      font-weight: 600;
+      color: #333;
+    }
+
+    .agent-card-header .direction {
+      margin-left: auto;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+    }
+
+    .direction-bullish {
+      background-color: #fff1f0;
+      color: #cf1322;
+    }
+
+    .direction-bearish {
+      background-color: #f6ffed;
+      color: #389e0d;
+    }
+
+    .direction-neutral {
+      background-color: #fffbe6;
+      color: #d48806;
+    }
+
+    .agent-confidence {
+      font-size: 11px;
+      color: #999;
+      margin-top: 4px;
+    }
+
+    .section-title {
+      padding: 0 15px;
+      margin: 15px 0 10px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #333;
+      border-left: 4px solid #722ed1;
+      line-height: 1.2;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .debate-section {
+      padding: 0 15px 10px;
+    }
+
+    .debate-card {
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .debate-card.bull {
+      background: linear-gradient(135deg, #fff1f0 0%, #fff 100%);
+      border: 1px solid #ffccc7;
+    }
+
+    .debate-card.bear {
+      background: linear-gradient(135deg, #f6ffed 0%, #fff 100%);
+      border: 1px solid #b7eb8f;
+    }
+
+    .debate-card.judge {
+      background: linear-gradient(135deg, #f9f0ff 0%, #fff 100%);
+      border: 1px solid #d3adf7;
+    }
+
+    .debate-card-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .debate-card.bull .debate-card-title {
+      color: #cf1322;
+    }
+
+    .debate-card.bear .debate-card-title {
+      color: #389e0d;
+    }
+
+    .debate-card.judge .debate-card-title {
+      color: #722ed1;
+    }
+
+    .content-area {
+      padding: 0 15px 10px;
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .content-area p {
+      margin: 0 0 8px;
+    }
+
+    .footer {
+      padding: 12px 15px;
+      text-align: center;
+      font-size: 11px;
+      color: #999;
+      border-top: 1px solid #f0f0f0;
+      background-color: #fafafa;
+    }
+
+    .meta-info {
+      display: flex;
+      justify-content: center;
+      gap: 15px;
+      font-size: 12px;
+      color: #999;
+      padding: 8px 15px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container">
+    <!-- 头部 -->
+    <div class="header">
+      <h1>⚖️ 多智能体博弈分析</h1>
+      <p>{{ fund_name }} ({{ fund_code }})</p>
+    </div>
+
+    <!-- 裁定结果 -->
+    <div class="verdict-section">
+      <div class="verdict-direction {{ direction_class }}">
+        {{ direction_emoji }} {{ final_direction }}
+      </div>
+      <div class="confidence-bar">
+        <div class="confidence-fill {{ direction_class }}" style="width: {{ confidence }}%"></div>
+      </div>
+      <div class="confidence-text">信心度: {{ confidence }}/100</div>
+      <div class="bull-bear-bar">
+        <div class="bull-bar" style="width: {{ bull_win_rate }}%">📈 {{ bull_win_rate }}%</div>
+        <div class="bear-bar" style="width: {{ bear_win_rate }}%">📉 {{ bear_win_rate }}%</div>
+      </div>
+    </div>
+
+    <!-- 六大分析师投票 -->
+    <div class="section-title">🧠 六大分析师研判</div>
+    <div class="agents-grid">
+      {% for agent in agents %}
+      <div class="agent-card">
+        <div class="agent-card-header">
+          <span class="emoji">{{ agent.emoji }}</span>
+          <span class="name">{{ agent.name }}</span>
+          <span class="direction direction-{{ agent.direction_class }}">{{ agent.direction }}</span>
+        </div>
+        <div class="agent-confidence">信心度: {{ agent.confidence }}/100</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- 多方论证 -->
+    <div class="section-title">🟢 多方辩手论证</div>
+    <div class="debate-section">
+      <div class="debate-card bull">
+        {{ bull_argument_html | safe }}
+      </div>
+    </div>
+
+    <!-- 空方论证 -->
+    <div class="section-title">🔴 空方辩手论证</div>
+    <div class="debate-section">
+      <div class="debate-card bear">
+        {{ bear_argument_html | safe }}
+      </div>
+    </div>
+
+    <!-- 裁判裁定 -->
+    <div class="section-title">⚖️ 博弈论综合裁定</div>
+    <div class="debate-section">
+      <div class="debate-card judge">
+        {{ judge_verdict_html | safe }}
+      </div>
+    </div>
+
+    <!-- 元数据 -->
+    <div class="meta-info">
+      <span>🤖 {{ total_llm_calls }} 次 AI 对话</span>
+      <span>⏱ 耗时 {{ total_time }}s</span>
+    </div>
+
+    <!-- 页脚 -->
+    <div class="footer">
+      📅 {{ generated_time }} | ⚠️ 投资有风险，决策需谨慎。本报告仅供参考，不构成投资建议。
+    </div>
+  </div>
+</body>
+
+</html>

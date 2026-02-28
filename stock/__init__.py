@@ -4,6 +4,7 @@ A股股票分析模块
 """
 
 from .analyzer import StockAnalyzer
+from .debate_engine import DebateEngine, DebateResult
 from .models import StockInfo
 
-__all__ = ["StockInfo", "StockAnalyzer"]
+__all__ = ["StockInfo", "StockAnalyzer", "DebateEngine", "DebateResult"]

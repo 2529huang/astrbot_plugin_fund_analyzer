@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -103,7 +103,9 @@ class FundAnalyzer:
         except (ValueError, TypeError):
             return default
 
-    async def get_lof_realtime(self, fund_code: str = None) -> FundInfo | None:
+    async def get_lof_realtime(
+        self, fund_code: Optional[str] = None
+    ) -> FundInfo | None:
         """
         获取LOF基金实时行情
 
@@ -143,7 +145,7 @@ class FundAnalyzer:
             return None
 
     async def get_lof_history(
-        self, fund_code: str = None, days: int = 30, adjust: str = "qfq"
+        self, fund_code: Optional[str] = None, days: int = 30, adjust: str = "qfq"
     ) -> list[dict] | None:
         """
         获取LOF基金历史行情
@@ -1331,13 +1333,23 @@ class FundAnalyzerPlugin(Star):
                 "🧠 AI 正在分析数据，生成报告中...\n📈 正在计算量化指标和策略回测..."
             )
 
-            # 5. 使用 AI 分析器执行分析（含量化数据）
+            # 5. 获取资金流向数据（场内基金）
+            fund_flow_text = ""
+            try:
+                fund_flow = await self.analyzer._api.get_fund_flow(fund_code, days=10)
+                fund_flow_text = self.analyzer._api.format_fund_flow_text(fund_flow)
+            except Exception as e:
+                logger.debug(f"获取资金流向失败: {e}")
+                fund_flow_text = "暂无资金流向数据"
+
+            # 6. 使用 AI 分析器执行分析（含量化数据和资金流向）
             try:
                 analysis_result = await self.ai_analyzer.analyze(
                     fund_info=info,
                     history_data=history or [],
                     technical_indicators=indicators,
                     user_id=user_id,
+                    fund_flow_text=fund_flow_text,
                 )
 
                 # 获取技术信号
@@ -1346,13 +1358,14 @@ class FundAnalyzerPlugin(Star):
                 # 使用 markdown 库将 Markdown 转换为 HTML
                 try:
                     import markdown
+
                     formatted_content = markdown.markdown(
-                        analysis_result,
-                        extensions=['nl2br', 'tables', 'fenced_code']
+                        analysis_result, extensions=["nl2br", "tables", "fenced_code"]
                     )
                 except ImportError:
                     # 如果 markdown 库不可用，回退到简单的正则替换
                     import re
+
                     formatted_content = re.sub(
                         r"\*\*(.*?)\*\*", r"<strong>\1</strong>", analysis_result
                     )
@@ -1397,7 +1410,7 @@ class FundAnalyzerPlugin(Star):
                             img_path = await render_fund_image(
                                 template_path=template_path,
                                 template_data=data,
-                                width=480
+                                width=480,
                             )
                             yield event.image_result(img_path)
                         except Exception as e:
@@ -1665,6 +1678,395 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"对比绘图失败: {e}")
             return None
 
+    # ============================================================
+    # 多智能体博弈分析指令
+    # ============================================================
+    @filter.command("股票智能分析")
+    async def multi_agent_debate(self, event: AstrMessageEvent, code: str = ""):
+        """
+        多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）
+        用法: 股票智能分析 [基金/股票代码]
+        示例: 股票智能分析 161226
+        """
+        try:
+            user_id = event.get_sender_id()
+            normalized_code = self._normalize_fund_code(code)
+            fund_code = normalized_code or self._get_user_fund(user_id)
+
+            yield event.plain_result(
+                f"⚖️ 即将对 {fund_code} 启动多智能体博弈分析\n"
+                "🧠 6 位 AI 分析师 + 多空辩论 + 博弈论裁定\n"
+                "📡 正在采集数据，预计需要 3-5 分钟..."
+            )
+
+            # 1. 获取基金基本信息
+            info = await self.analyzer.get_lof_realtime(fund_code)
+            if not info:
+                if (
+                    normalized_code
+                    and len(normalized_code) == 6
+                    and normalized_code.isdigit()
+                ):
+                    try:
+                        search_res = await self.analyzer.search_fund(normalized_code)
+                        if not search_res:
+                            yield event.plain_result(
+                                f"❌ 未找到基金代码 {fund_code}\n"
+                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
+                            )
+                            return
+                    except Exception:
+                        pass
+                yield event.plain_result(
+                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
+                    "💡 可能是数据源暂时不可用，请稍后重试"
+                )
+                return
+
+            # 2. 检查大模型是否可用
+            provider = self.context.get_using_provider()
+            if not provider:
+                yield event.plain_result(
+                    "❌ 未配置大模型提供商\n"
+                    "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
+                )
+                return
+
+            # 3. 获取历史数据和资金流向
+            history_task = self.analyzer.get_lof_history(fund_code, days=60)
+            flow_task = self.analyzer._api.get_fund_flow(fund_code, days=10)
+
+            history_data = await history_task
+            fund_flow_data = []
+            try:
+                fund_flow_data = await flow_task
+            except Exception as e:
+                logger.debug(f"获取资金流向失败: {e}")
+
+            if not history_data or len(history_data) < 10:
+                yield event.plain_result(
+                    f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
+                )
+                return
+
+            # 4. 获取新闻摘要和影响因素
+            # yield event.plain_result("📰 正在获取市场资讯和影响因素...")
+
+            news_summary = await self.ai_analyzer.get_news_summary(info.name, info.code)
+            factors_text = self.ai_analyzer.factors.format_factors_text(info.name)
+            global_situation_text = (
+                self.ai_analyzer.factors.format_global_situation_text(info.name)
+            )
+
+            # 5. 创建辩论引擎并执行
+            from .stock.debate_engine import DebateEngine
+
+            engine = DebateEngine(self.context)
+
+            # 进度回调：通过 yield 发送进度消息
+            progress_messages = []
+
+            async def on_progress(msg: str):
+                progress_messages.append(msg)
+
+            debate_result = await engine.run_debate(
+                fund_info=info,
+                history_data=history_data,
+                fund_flow_data=fund_flow_data,
+                news_summary=news_summary,
+                factors_text=factors_text,
+                global_situation_text=global_situation_text,
+                quant_analyzer=self.ai_analyzer.quant,
+                eastmoney_api=self.analyzer._api,
+                progress_callback=on_progress,
+            )
+
+            # 6. 发送进度汇总
+            if progress_messages:
+                yield event.plain_result("\n".join(progress_messages))
+
+            # 7. 尝试渲染图片报告
+            def _md_to_html(text: str) -> str:
+                """将 Markdown 文本转换为 HTML（内置实现，无外部依赖）"""
+                import re as _re
+
+                if not text:
+                    return ""
+
+                lines = text.split("\n")
+                html_parts: list[str] = []
+                i = 0
+
+                while i < len(lines):
+                    line = lines[i]
+                    stripped = line.strip()
+
+                    # 空行 → 段落间距
+                    if not stripped:
+                        html_parts.append("")
+                        i += 1
+                        continue
+
+                    # 标题 h1-h6
+                    h_match = _re.match(r"^(#{1,6})\s+(.+)$", stripped)
+                    if h_match:
+                        level = len(h_match.group(1))
+                        content = _inline_md(h_match.group(2))
+                        fs = max(18 - level * 2, 12)
+                        html_parts.append(
+                            f"<h{level} style='margin:8px 0 4px;"
+                            f"font-size:{fs}px'>"
+                            f"{content}</h{level}>"
+                        )
+                        i += 1
+                        continue
+
+                    # 水平线
+                    if _re.match(r"^[-*_]{3,}\s*$", stripped):
+                        html_parts.append(
+                            "<hr style='border:none;"
+                            "border-top:1px solid #e0e0e0;"
+                            "margin:8px 0'>"
+                        )
+                        i += 1
+                        continue
+
+                    # 表格（以 | 开头的连续行）
+                    if stripped.startswith("|") and "|" in stripped[1:]:
+                        table_lines = []
+                        while i < len(lines) and lines[i].strip().startswith("|"):
+                            table_lines.append(lines[i].strip())
+                            i += 1
+                        html_parts.append(_table_to_html(table_lines))
+                        continue
+
+                    # 无序列表（- / * / + 开头）
+                    if _re.match(r"^[-*+]\s+", stripped):
+                        items = []
+                        while i < len(lines):
+                            li_match = _re.match(
+                                r"^\s*[-*+]\s+(.+)$", lines[i].strip()
+                            )
+                            if li_match:
+                                items.append(_inline_md(li_match.group(1)))
+                                i += 1
+                            elif lines[i].strip() == "":
+                                i += 1
+                                break
+                            else:
+                                break
+                        li_html = "".join(f"<li>{it}</li>" for it in items)
+                        html_parts.append(
+                            f"<ul style='margin:4px 0;padding-left:20px'>{li_html}</ul>"
+                        )
+                        continue
+
+                    # 有序列表（1. 开头）
+                    if _re.match(r"^\d+[.)]\s+", stripped):
+                        items = []
+                        while i < len(lines):
+                            ol_match = _re.match(
+                                r"^\s*\d+[.)]\s+(.+)$", lines[i].strip()
+                            )
+                            if ol_match:
+                                items.append(_inline_md(ol_match.group(1)))
+                                i += 1
+                            elif lines[i].strip() == "":
+                                i += 1
+                                break
+                            else:
+                                break
+                        li_html = "".join(f"<li>{it}</li>" for it in items)
+                        html_parts.append(
+                            f"<ol style='margin:4px 0;padding-left:20px'>{li_html}</ol>"
+                        )
+                        continue
+
+                    # 普通文本行
+                    content = _inline_md(stripped)
+                    html_parts.append(
+                        f"<p style='margin:4px 0'>{content}</p>"
+                    )
+                    i += 1
+
+                return "\n".join(html_parts)
+
+            def _inline_md(text: str) -> str:
+                """处理行内 Markdown 格式"""
+                import re as _re
+
+                # 加粗+斜体 ***text***
+                text = _re.sub(
+                    r"\*{3}(.+?)\*{3}",
+                    r"<strong><em>\1</em></strong>",
+                    text,
+                )
+                # 加粗 **text**
+                text = _re.sub(
+                    r"\*{2}(.+?)\*{2}",
+                    r"<strong>\1</strong>",
+                    text,
+                )
+                # 斜体 *text*
+                text = _re.sub(
+                    r"\*(.+?)\*",
+                    r"<em>\1</em>",
+                    text,
+                )
+                # 行内代码 `code`
+                code_style = (
+                    "background:#f5f5f5;padding:1px 4px;"
+                    "border-radius:3px;font-size:12px"
+                )
+                text = _re.sub(
+                    r"`([^`]+)`",
+                    rf"<code style='{code_style}'>\1</code>",
+                    text,
+                )
+                # 链接 [text](url)
+                text = _re.sub(
+                    r"\[([^\]]+)\]\(([^\)]+)\)",
+                    r'<a href="\2">\1</a>',
+                    text,
+                )
+                # emoji 标记保留（🔺🔻等已是 unicode）
+                return text
+
+            def _table_to_html(table_lines: list[str]) -> str:
+                """将 Markdown 表格行转换为 HTML 表格"""
+                import re as _re
+
+                if len(table_lines) < 2:
+                    return "<br>".join(table_lines)
+
+                def _parse_row(row: str) -> list[str]:
+                    cells = row.strip().strip("|").split("|")
+                    return [_inline_md(c.strip()) for c in cells]
+
+                rows = []
+                for tl in table_lines:
+                    # 跳过分隔行 |---|---|
+                    if _re.match(r"^\|[\s\-:|]+\|$", tl):
+                        continue
+                    rows.append(_parse_row(tl))
+
+                if not rows:
+                    return ""
+
+                style = (
+                    "width:100%;border-collapse:collapse;font-size:12px;margin:6px 0"
+                )
+                td_style = "border:1px solid #e0e0e0;padding:4px 6px"
+                th_style = f"{td_style};background:#f5f5f5;font-weight:600"
+
+                # 第一行当表头
+                header = rows[0]
+                th_html = "".join(f"<th style='{th_style}'>{c}</th>" for c in header)
+                body_html = ""
+                for row in rows[1:]:
+                    td_html = "".join(f"<td style='{td_style}'>{c}</td>" for c in row)
+                    body_html += f"<tr>{td_html}</tr>"
+
+                return (
+                    f"<table style='{style}'>"
+                    f"<thead><tr>{th_html}</tr></thead>"
+                    f"<tbody>{body_html}</tbody>"
+                    f"</table>"
+                )
+
+            direction_class_map = {
+                "看涨": "bullish",
+                "看跌": "bearish",
+                "中性": "neutral",
+            }
+            direction_emoji_map = {"看涨": "📈", "看跌": "📉", "中性": "↔️"}
+
+            agents_data = []
+            for r in debate_result.agent_reports:
+                agents_data.append(
+                    {
+                        "emoji": r.agent_emoji,
+                        "name": r.agent_name,
+                        "direction": r.direction,
+                        "direction_class": direction_class_map.get(
+                            r.direction, "neutral"
+                        ),
+                        "confidence": f"{r.confidence:.0f}",
+                    }
+                )
+
+            tmpl_data = {
+                "fund_name": info.name,
+                "fund_code": info.code,
+                "final_direction": debate_result.final_direction,
+                "direction_class": direction_class_map.get(
+                    debate_result.final_direction, "neutral"
+                ),
+                "direction_emoji": direction_emoji_map.get(
+                    debate_result.final_direction, "❓"
+                ),
+                "confidence": f"{debate_result.confidence:.0f}",
+                "bull_win_rate": f"{debate_result.bull_win_rate:.0f}",
+                "bear_win_rate": f"{debate_result.bear_win_rate:.0f}",
+                "agents": agents_data,
+                "bull_argument_html": _md_to_html(debate_result.bull_argument),
+                "bear_argument_html": _md_to_html(debate_result.bear_argument),
+                "judge_verdict_html": _md_to_html(debate_result.judge_verdict),
+                "total_llm_calls": debate_result.total_llm_calls,
+                "total_time": f"{debate_result.total_time_seconds:.0f}",
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            template_path = self._data_dir / "templates" / "debate_report.html"
+            if not template_path.exists():
+                template_path = (
+                    Path(__file__).parent / "templates" / "debate_report.html"
+                )
+
+            if template_path.exists():
+                # 渲染图片报告
+                if self.use_local_renderer:
+                    try:
+                        img_path = await render_fund_image(
+                            template_path=template_path,
+                            template_data=tmpl_data,
+                            width=520,
+                        )
+                        yield event.image_result(img_path)
+                    except Exception as e:
+                        logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
+                        with open(template_path, encoding="utf-8") as f:
+                            template_str = f.read()
+                        img_url = await self.image_renderer.render_custom_template(
+                            tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
+                        )
+                        yield event.image_result(img_url)
+                else:
+                    with open(template_path, encoding="utf-8") as f:
+                        template_str = f.read()
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
+                    )
+                    yield event.image_result(img_url)
+            else:
+                # 降级到纯文本摘要
+                summary = engine.format_debate_summary(debate_result)
+                yield event.plain_result(summary)
+
+            # 8. 发送简洁文字结论（纯文本，不含 markdown）
+            summary = engine.format_debate_summary(debate_result)
+            yield event.plain_result(summary)
+
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError as e:
+            yield event.plain_result(f"⏰ {str(e)}\n💡 数据源响应较慢，请稍后再试")
+        except Exception as e:
+            logger.error(f"多智能体博弈分析出错: {e}")
+            yield event.plain_result(f"❌ 博弈分析失败: {str(e)}")
+
     @filter.command("基金对比")
     async def fund_compare(
         self, event: AstrMessageEvent, code1: str = "", code2: str = ""
@@ -1819,6 +2221,7 @@ class FundAnalyzerPlugin(Star):
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化分析 [代码] - 📈专业量化指标分析
 🔹 智能分析 [代码] - 🤖AI量化深度分析
+🔹 股票智能分析 [代码] - ⚖️多智能体博弈分析
 🔹 基金历史 [代码] [天数] - 查看历史行情
 🔹 搜索基金 关键词 - 搜索LOF基金
 🔹 设置基金 代码 - 设置默认基金
@@ -1836,6 +2239,7 @@ class FundAnalyzerPlugin(Star):
   • 基金对比 161226 513100
   • 量化分析 161226
   • 智能分析 161226
+  • 股票智能分析 161226
   • 基金历史 161226 20
   • 搜索基金 白银
 ━━━━━━━━━━━━━━━━━
@@ -1846,6 +2250,15 @@ class FundAnalyzerPlugin(Star):
   - 策略回测结果解读
   - 相关市场动态和新闻
   - 上涨趋势和概率预测
+━━━━━━━━━━━━━━━━━
+⚖️ 多智能体博弈分析说明:
+  6 位 AI 分析师独立研判 + 多空辩论 + 博弈论裁定:
+  - 📰 舆情Agent: 情绪因子与市场舆论
+  - 🦈 游资Agent: 龙虎榜与游资行为
+  - 🛡️ 风控Agent: 政策风险与红线监控
+  - 📊 技术Agent: 技术指标与趋势信号
+  - 🧩 筹码Agent: 主力行为与筹码分布
+  - ⚡ 大单Agent: 实时资金流向与异动
 ━━━━━━━━━━━━━━━━━
 ⚠️ 数据来源: AKShare/国际金价网
 💡 A股数据缓存10分钟，仅供参考
