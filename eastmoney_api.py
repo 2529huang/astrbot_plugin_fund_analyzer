@@ -298,13 +298,22 @@ class EastMoneyAPI:
         # === 1. 东方财富主源 ===
         params = {
             "secid": f"{market}.{fund_code}",
-            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170",
+            "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f152,f168,f169,f170",
         }
         
         data = await self._request(self.QUOTE_API, params)
         if data and data.get("rc") == 0:
             result = data.get("data", {})
             if result:
+                # f152 表示价格的小数位数：股票=2, LOF/ETF基金=3
+                # 用 10^f152 作为价格字段的除数，确保不同证券类型都正确
+                decimal_places = result.get("f152", 2)
+                try:
+                    decimal_places = int(decimal_places)
+                except (ValueError, TypeError):
+                    decimal_places = 2
+                price_divisor = 10 ** decimal_places
+                
                 def safe_float(val, divisor=1):
                     if val is None or val == "-":
                         return 0.0
@@ -316,13 +325,13 @@ class EastMoneyAPI:
                 return {
                     "code": str(result.get("f57", fund_code)),
                     "name": str(result.get("f58", "")),
-                    "latest_price": safe_float(result.get("f43"), 1000),
-                    "change_amount": safe_float(result.get("f169"), 1000),
+                    "latest_price": safe_float(result.get("f43"), price_divisor),
+                    "change_amount": safe_float(result.get("f169"), price_divisor),
                     "change_rate": safe_float(result.get("f170"), 100),
-                    "open_price": safe_float(result.get("f46"), 1000),
-                    "high_price": safe_float(result.get("f44"), 1000),
-                    "low_price": safe_float(result.get("f45"), 1000),
-                    "prev_close": safe_float(result.get("f60"), 1000),
+                    "open_price": safe_float(result.get("f46"), price_divisor),
+                    "high_price": safe_float(result.get("f44"), price_divisor),
+                    "low_price": safe_float(result.get("f45"), price_divisor),
+                    "prev_close": safe_float(result.get("f60"), price_divisor),
                     "volume": safe_float(result.get("f47")),
                     "amount": safe_float(result.get("f48")),
                     "turnover_rate": safe_float(result.get("f168"), 100),
