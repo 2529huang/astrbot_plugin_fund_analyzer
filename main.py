@@ -399,6 +399,12 @@ class FundAnalyzerPlugin(Star):
             status = "上" if current > indicators["ma20"] else "下"
             ma_status.append(f"MA20({indicators['ma20']:.4f}){status}")
 
+        def _fmt_ret(v):
+            return "--" if v is None else f"{v:+.2f}"
+
+        def _fmt_4(v):
+            return "--" if v is None else f"{v:.4f}"
+
         return f"""
 📈 【{info.name}】技术分析
 ━━━━━━━━━━━━━━━━━
@@ -408,14 +414,14 @@ class FundAnalyzerPlugin(Star):
   • {" | ".join(ma_status) if ma_status else "数据不足"}
 ━━━━━━━━━━━━━━━━━
 📈 区间收益率:
-  • 5日收益: {indicators.get("return_5d", "--"):+.2f}%
-  • 10日收益: {indicators.get("return_10d", "--"):+.2f}%
-  • 20日收益: {indicators.get("return_20d", "--"):+.2f}%
+  • 5日收益: {_fmt_ret(indicators.get("return_5d"))}%
+  • 10日收益: {_fmt_ret(indicators.get("return_10d"))}%
+  • 20日收益: {_fmt_ret(indicators.get("return_20d"))}%
 ━━━━━━━━━━━━━━━━━
 📉 波动分析:
-  • 20日波动率: {indicators.get("volatility", "--"):.4f}
-  • 20日最高: {indicators.get("high_20d", "--"):.4f}
-  • 20日最低: {indicators.get("low_20d", "--"):.4f}
+  • 20日波动率: {_fmt_4(indicators.get("volatility"))}
+  • 20日最高: {_fmt_4(indicators.get("high_20d"))}
+  • 20日最低: {_fmt_4(indicators.get("low_20d"))}
 ━━━━━━━━━━━━━━━━━
 💡 投资建议: 请结合自身风险承受能力谨慎投资
 """.strip()
@@ -904,29 +910,31 @@ class FundAnalyzerPlugin(Star):
                 "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            # 读取模板
-            template_path = self._data_dir / "templates" / "analysis_report.html"
-            # 如果不在数据目录，尝试检查插件目录
-            if not template_path.exists():
-                template_path = (
-                    Path(__file__).parent / "templates" / "analysis_report.html"
-                )
+            # # 读取模板
+            # template_path = self._data_dir / "templates" / "analysis_report.html"
+            # # 如果不在数据目录，尝试检查插件目录
+            # if not template_path.exists():
+            #     template_path = (
+            #         Path(__file__).parent / "templates" / "analysis_report.html"
+            #     )
 
-            if not template_path.exists():
-                # 降级到文本模式
-                yield event.plain_result(self._format_analysis(info, indicators))
-                return
+            # if not template_path.exists():
+            #     # 降级到文本模式
+            #     yield event.plain_result(self._format_analysis(info, indicators))
+            #     return
 
-            with open(template_path, "r", encoding="utf-8") as f:
-                template_str = f.read()
+            # with open(template_path, "r", encoding="utf-8") as f:
+            #     template_str = f.read()
 
-            # 渲染图片
-            img_url = await self.image_renderer.render_custom_template(
-                tmpl_str=template_str, tmpl_data=data, return_url=True
-            )
+            # # 渲染图片
+            # img_url = await self.image_renderer.render_custom_template(
+            #     tmpl_str=template_str, tmpl_data=data, return_url=True
+            # )
 
-            # 发送图片
-            yield event.image_result(img_url)
+            # # 发送图片
+            # yield event.image_result(img_url)
+            yield event.plain_result(self._format_analysis(info, indicators))
+            return
 
         except ImportError:
             yield event.plain_result(
@@ -1497,7 +1505,6 @@ class FundAnalyzerPlugin(Star):
                     "💡 可能是数据源暂时不可用，或该基金为非LOF基金\n"
                     "💡 请稍后重试"
                 )
-                return
                 return
 
             # 2. 获取60天历史数据
