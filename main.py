@@ -24,6 +24,7 @@ from .image_generator import render_fund_image, PLAYWRIGHT_AVAILABLE
 
 # 导入东方财富 API 模块（直接 HTTP 请求，不依赖 akshare）
 from .eastmoney_api import get_api as get_eastmoney_api
+from .fund_code_parse import parse_fund_code_hint
 
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
 DEFAULT_TIMEOUT = 120  # 2分钟
@@ -104,13 +105,17 @@ class FundAnalyzer:
             return default
 
     async def get_lof_realtime(
-        self, fund_code: Optional[str] = None
+        self,
+        fund_code: Optional[str] = None,
+        *,
+        prefer_otc: bool = False,
     ) -> FundInfo | None:
         """
         获取LOF基金实时行情
 
         Args:
             fund_code: 基金代码，默认为国投瑞银白银期货LOF
+            prefer_otc: True=场外估值；False=交易所行情（默认）
 
         Returns:
             FundInfo 对象或 None
@@ -121,7 +126,7 @@ class FundAnalyzer:
         fund_code = str(fund_code).strip()
 
         try:
-            data = await self._api.get_fund_realtime(fund_code)
+            data = await self._api.get_fund_realtime(fund_code, prefer_otc=prefer_otc)
             if not data:
                 logger.warning(f"未找到基金数据: {fund_code}")
                 return None
@@ -145,7 +150,12 @@ class FundAnalyzer:
             return None
 
     async def get_lof_history(
-        self, fund_code: Optional[str] = None, days: int = 30, adjust: str = "qfq"
+        self,
+        fund_code: Optional[str] = None,
+        days: int = 30,
+        adjust: str = "qfq",
+        *,
+        prefer_otc: bool = False,
     ) -> list[dict] | None:
         """
         获取LOF基金历史行情
@@ -154,6 +164,7 @@ class FundAnalyzer:
             fund_code: 基金代码
             days: 获取天数
             adjust: 复权类型 qfq-前复权, hfq-后复权, ""-不复权
+            prefer_otc: 与 get_lof_realtime 一致
 
         Returns:
             历史数据列表或 None
@@ -164,7 +175,9 @@ class FundAnalyzer:
         fund_code = str(fund_code).strip()
 
         try:
-            history = await self._api.get_fund_history(fund_code, days, adjust)
+            history = await self._api.get_fund_history(
+                fund_code, days, adjust, prefer_otc=prefer_otc
+            )
             return history
         except Exception as e:
             logger.error(f"获取LOF基金历史行情失败: {e}")
@@ -335,6 +348,18 @@ class FundAnalyzerPlugin(Star):
             return None
         # 补齐前导0到6位
         return code_str.zfill(6)
+
+    def _parse_fund_command_input(self, code: str | int | None, user_id: str):
+        """解析指令中的六位代码与场外/场内偏好；未填时使用用户默认基金。
+
+        Returns:
+            (fund_code, prefer_otc, explicit_code_or_None)
+            explicit_code_or_None：用户未输入有效数字时为 None。
+        """
+        parsed, prefer = parse_fund_code_hint(code)
+        if parsed is not None:
+            return parsed, prefer, parsed
+        return self._get_user_fund(user_id), False, None
 
     def _format_fund_info(self, info: FundInfo) -> str:
         """格式化基金信息为文本"""
@@ -783,13 +808,15 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             yield event.plain_result(f"🔍 正在查询基金 {fund_code} 的实时行情...")
 
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
 
             if info:
                 yield event.plain_result(self._format_fund_info(info))
@@ -838,14 +865,16 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             yield event.plain_result(f"📊 正在生成基金 {fund_code} 分析报告...")
 
             # 获取实时行情
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
             if not info:
                 # 区分是基金代码错误还是数据源问题
                 if not normalized_code:
@@ -874,7 +903,9 @@ class FundAnalyzerPlugin(Star):
                 return
 
             # 获取历史数据进行分析
-            history = await self.analyzer.get_lof_history(fund_code, days=30)
+            history = await self.analyzer.get_lof_history(
+                fund_code, days=30, prefer_otc=prefer_otc
+            )
 
             # 计算技术指标
             indicators = {}
@@ -1066,9 +1097,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             try:
                 num_days = int(days)
@@ -1084,10 +1115,14 @@ class FundAnalyzerPlugin(Star):
             )
 
             # 获取基金名称
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
             fund_name = info.name if info else fund_code
 
-            history = await self.analyzer.get_lof_history(fund_code, days=num_days)
+            history = await self.analyzer.get_lof_history(
+                fund_code, days=num_days, prefer_otc=prefer_otc
+            )
 
             if history:
                 # 绘制走势图
@@ -1242,10 +1277,19 @@ class FundAnalyzerPlugin(Star):
             return
 
         try:
-            # 标准化基金代码，补齐前导0
-            code = self._normalize_fund_code(code) or code
+            # 解析六位代码；设置默认基金时需能区分场外以便校验
+            parsed, prefer_otc = parse_fund_code_hint(code)
+            if not parsed:
+                yield event.plain_result(
+                    f"❌ 无效的基金代码\n"
+                    "💡 请使用六位数字代码，场外可加后缀 .OF 或前缀「场外」"
+                )
+                return
+            code = parsed
             # 验证基金代码是否有效
-            info = await self.analyzer.get_lof_realtime(code)
+            info = await self.analyzer.get_lof_realtime(
+                parsed, prefer_otc=prefer_otc
+            )
 
             if info:
                 user_id = event.get_sender_id()
@@ -1281,9 +1325,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             yield event.plain_result(
                 f"🤖 正在对基金 {fund_code} 进行智能分析...\n"
@@ -1291,7 +1335,9 @@ class FundAnalyzerPlugin(Star):
             )
 
             # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
             if not info:
                 # 区分是基金代码错误还是数据源问题
                 if not normalized_code:
@@ -1318,10 +1364,11 @@ class FundAnalyzerPlugin(Star):
                     "💡 请稍后重试"
                 )
                 return
-                return
 
             # 2. 获取历史数据（获取60天以支持更多回测策略）
-            history = await self.analyzer.get_lof_history(fund_code, days=60)
+            history = await self.analyzer.get_lof_history(
+                fund_code, days=60, prefer_otc=prefer_otc
+            )
 
             # 3. 计算技术指标（保留旧方法兼容性）
             indicators = {}
@@ -1344,7 +1391,9 @@ class FundAnalyzerPlugin(Star):
             # 5. 获取资金流向数据（场内基金）
             fund_flow_text = ""
             try:
-                fund_flow = await self.analyzer._api.get_fund_flow(fund_code, days=10)
+                fund_flow = await self.analyzer._api.get_fund_flow(
+                    fund_code, days=10, prefer_otc=prefer_otc
+                )
                 fund_flow_text = self.analyzer._api.format_fund_flow_text(fund_flow)
             except Exception as e:
                 logger.debug(f"获取资金流向失败: {e}")
@@ -1469,9 +1518,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            # 标准化基金代码，补齐前导0
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             yield event.plain_result(
                 f"📊 正在对基金 {fund_code} 进行量化分析...\n"
@@ -1479,7 +1528,9 @@ class FundAnalyzerPlugin(Star):
             )
 
             # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
             if not info:
                 # 区分是基金代码错误还是数据源问题
                 if not normalized_code:
@@ -1508,7 +1559,9 @@ class FundAnalyzerPlugin(Star):
                 return
 
             # 2. 获取60天历史数据
-            history = await self.analyzer.get_lof_history(fund_code, days=60)
+            history = await self.analyzer.get_lof_history(
+                fund_code, days=60, prefer_otc=prefer_otc
+            )
 
             if not history or len(history) < 20:
                 yield event.plain_result(
@@ -1697,8 +1750,9 @@ class FundAnalyzerPlugin(Star):
         """
         try:
             user_id = event.get_sender_id()
-            normalized_code = self._normalize_fund_code(code)
-            fund_code = normalized_code or self._get_user_fund(user_id)
+            fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
+                code, user_id
+            )
 
             yield event.plain_result(
                 f"⚖️ 即将对 {fund_code} 启动多智能体博弈分析\n"
@@ -1707,7 +1761,9 @@ class FundAnalyzerPlugin(Star):
             )
 
             # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(fund_code)
+            info = await self.analyzer.get_lof_realtime(
+                fund_code, prefer_otc=prefer_otc
+            )
             if not info:
                 if (
                     normalized_code
@@ -1740,8 +1796,12 @@ class FundAnalyzerPlugin(Star):
                 return
 
             # 3. 获取历史数据和资金流向
-            history_task = self.analyzer.get_lof_history(fund_code, days=60)
-            flow_task = self.analyzer._api.get_fund_flow(fund_code, days=10)
+            history_task = self.analyzer.get_lof_history(
+                fund_code, days=60, prefer_otc=prefer_otc
+            )
+            flow_task = self.analyzer._api.get_fund_flow(
+                fund_code, days=10, prefer_otc=prefer_otc
+            )
 
             history_data = await history_task
             fund_flow_data = []
@@ -2090,18 +2150,20 @@ class FundAnalyzerPlugin(Star):
             return
 
         try:
-            # 标准化代码
-            code1 = self._normalize_fund_code(code1) or code1
-            code2 = self._normalize_fund_code(code2) or code2
+            p1, o1 = parse_fund_code_hint(code1)
+            p2, o2 = parse_fund_code_hint(code2)
+            code1 = p1 if p1 else (self._normalize_fund_code(code1) or code1.strip())
+            code2 = p2 if p2 else (self._normalize_fund_code(code2) or code2.strip())
+            pref1 = o1 if p1 else False
+            pref2 = o2 if p2 else False
 
             yield event.plain_result(f"⚖️ 正在对比基金 {code1} vs {code2}...")
 
             # 并发获取两个基金的信息和历史数据
-            # 使用 gather 提高效率
-            task1 = self.analyzer.get_lof_realtime(code1)
-            task2 = self.analyzer.get_lof_realtime(code2)
-            task3 = self.analyzer.get_lof_history(code1, days=60)
-            task4 = self.analyzer.get_lof_history(code2, days=60)
+            task1 = self.analyzer.get_lof_realtime(code1, prefer_otc=pref1)
+            task2 = self.analyzer.get_lof_realtime(code2, prefer_otc=pref2)
+            task3 = self.analyzer.get_lof_history(code1, days=60, prefer_otc=pref1)
+            task4 = self.analyzer.get_lof_history(code2, days=60, prefer_otc=pref2)
 
             info1, info2, hist1, hist2 = await asyncio.gather(
                 task1, task2, task3, task4
@@ -2236,6 +2298,8 @@ class FundAnalyzerPlugin(Star):
 ━━━━━━━━━━━━━━━━━
 💡 默认基金: 国投瑞银白银期货(LOF)A
    基金代码: 161226
+━━━━━━━━━━━━━━━━━
+📌 场外基金请在代码后加 .OF 或前缀「场外」；仅六位数字默认走交易所行情
 ━━━━━━━━━━━━━━━━━
 📈 示例:
   • 今日行情 (金银价格)

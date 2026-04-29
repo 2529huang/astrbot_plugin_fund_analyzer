@@ -180,56 +180,43 @@ class EastMoneyAPI:
 
     def _is_otc_fund(self, fund_code: str) -> bool:
         """
-        判断是否为场外基金
-        
-        场外基金代码通常是0开头的6位数字，但不包括以下场内基金:
-        - 000xxx 部分是场内基金
-        - 00xxxx 部分是场内基金
-        
-        场内基金代码特征:
-        - 1xxxxx: 深交所LOF/ETF
-        - 5xxxxx: 上交所ETF
-        - 6xxxxx: 上交所股票
-        
-        场外基金代码特征:
-        - 0xxxxx: 大部分场外基金
-        - 2xxxxx: 部分场外基金
-        - 3xxxxx: 创业板股票 (不处理)
+        在未指定 prefer_otc 时的兜底启发式（不以 0 字头号段猜场外）。
+
+        场内基金/etf 常见：1、5 开头（深交所·上交所）。
+        部分场外申购代码以 2 开头居多。
+        以 0 开头时不再猜场外（与用户输入后缀/前缀区分场外）。
         """
         if not fund_code or len(fund_code) != 6:
             return False
-        
-        # 1开头或5开头通常是场内ETF/LOF
+
         if fund_code.startswith(("1", "5")):
             return False
-        
-        # 0开头的大部分是场外基金
-        if fund_code.startswith("0"):
-            return True
-        
-        # 2开头的是场外基金
+
         if fund_code.startswith("2"):
             return True
-        
+
         return False
 
-    async def get_fund_realtime(self, fund_code: str) -> Optional[dict]:
+    async def get_fund_realtime(
+        self, fund_code: str, prefer_otc: Optional[bool] = None
+    ) -> Optional[dict]:
         """
         获取单只基金实时行情（自动判断场内/场外）
-        
+
         Args:
             fund_code: 基金代码
-            
-        Returns:
-            行情数据字典或 None
+            prefer_otc: True=场外估值接口；False=交易所行情；
+                None 时使用 _is_otc_fund 兜底
         """
         fund_code = str(fund_code).strip()
-        
-        # 判断是场内还是场外基金
+
+        if prefer_otc is True:
+            return await self._get_otc_fund_realtime(fund_code)
+        if prefer_otc is False:
+            return await self._get_exchange_fund_realtime(fund_code)
         if self._is_otc_fund(fund_code):
             return await self._get_otc_fund_realtime(fund_code)
-        else:
-            return await self._get_exchange_fund_realtime(fund_code)
+        return await self._get_exchange_fund_realtime(fund_code)
 
     async def _get_otc_fund_realtime(self, fund_code: str) -> Optional[dict]:
         """
@@ -452,25 +439,29 @@ class EastMoneyAPI:
         fund_code: str,
         days: int = 30,
         adjust: str = "qfq",
+        prefer_otc: Optional[bool] = None,
     ) -> Optional[list]:
         """
         获取基金历史数据（自动判断场内/场外）
-        
+
         Args:
             fund_code: 基金代码
             days: 获取天数
             adjust: 复权类型 (qfq=前复权, hfq=后复权, 空=不复权)
-            
+            prefer_otc: True/False 见 get_fund_realtime；None 为兜底启发式
+
         Returns:
             历史数据列表或 None
         """
         fund_code = str(fund_code).strip()
-        
-        # 判断是场内还是场外基金
+
+        if prefer_otc is True:
+            return await self._get_otc_fund_history(fund_code, days)
+        if prefer_otc is False:
+            return await self._get_exchange_fund_history(fund_code, days, adjust)
         if self._is_otc_fund(fund_code):
             return await self._get_otc_fund_history(fund_code, days)
-        else:
-            return await self._get_exchange_fund_history(fund_code, days, adjust)
+        return await self._get_exchange_fund_history(fund_code, days, adjust)
 
     async def _get_otc_fund_history(
         self,
@@ -910,28 +901,24 @@ class EastMoneyAPI:
                 fund["change_amount"] = realtime["change_amount"]
     
     async def get_fund_flow(
-        self, fund_code: str, days: int = 10
+        self, fund_code: str, days: int = 10, prefer_otc: Optional[bool] = None
     ) -> Optional[list[dict]]:
         """
         获取基金/股票资金流向数据（主力净流入等）
-        
+
         依次尝试：东方财富push2 → 东方财富datacenter
         仅场内基金有资金流向数据，场外基金返回 None
-        
+
         Args:
             fund_code: 基金代码（场内ETF/LOF/股票）
             days: 获取天数
-            
-        Returns:
-            资金流向数据列表或 None，每条包含：
-            date, main_net_inflow（主力净流入），
-            super_large_inflow（超大单净流入），large_inflow（大单净流入），
-            medium_inflow（中单净流入），small_inflow（小单净流入）
+            prefer_otc: True 时直接返回 None；False 拉取场内；None 用启发式
         """
         fund_code = str(fund_code).strip()
-        
-        # 场外基金无资金流向数据
-        if self._is_otc_fund(fund_code):
+
+        if prefer_otc is True:
+            return None
+        if prefer_otc is None and self._is_otc_fund(fund_code):
             return None
         
         # === 1. 东方财富 push2 主源 ===
