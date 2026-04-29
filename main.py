@@ -1392,7 +1392,7 @@ class FundAnalyzerPlugin(Star):
             fund_flow_text = ""
             try:
                 fund_flow = await self.analyzer._api.get_fund_flow(
-                    fund_code, days=10, prefer_otc=prefer_otc
+                    fund_code, days=0, prefer_otc=prefer_otc
                 )
                 fund_flow_text = self.analyzer._api.format_fund_flow_text(fund_flow)
             except Exception as e:
@@ -1800,7 +1800,7 @@ class FundAnalyzerPlugin(Star):
                 fund_code, days=60, prefer_otc=prefer_otc
             )
             flow_task = self.analyzer._api.get_fund_flow(
-                fund_code, days=10, prefer_otc=prefer_otc
+                fund_code, days=0, prefer_otc=prefer_otc
             )
 
             history_data = await history_task
