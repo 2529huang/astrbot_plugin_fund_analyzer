@@ -440,6 +440,8 @@ class EastMoneyAPI:
         days: int = 30,
         adjust: str = "qfq",
         prefer_otc: Optional[bool] = None,
+        *,
+        kline_max_retries: int = 3,
     ) -> Optional[list]:
         """
         获取基金历史数据（自动判断场内/场外）
@@ -449,6 +451,7 @@ class EastMoneyAPI:
             days: 获取天数
             adjust: 复权类型 (qfq=前复权, hfq=后复权, 空=不复权)
             prefer_otc: True/False 见 get_fund_realtime；None 为兜底启发式
+            kline_max_retries: 仅场内交易所 K 线经 _request 时的最大尝试次数（默认 3）；批量精选可降为 1 避免「单只反复打源站」。
 
         Returns:
             历史数据列表或 None
@@ -458,10 +461,14 @@ class EastMoneyAPI:
         if prefer_otc is True:
             return await self._get_otc_fund_history(fund_code, days)
         if prefer_otc is False:
-            return await self._get_exchange_fund_history(fund_code, days, adjust)
+            return await self._get_exchange_fund_history(
+                fund_code, days, adjust, max_retries=kline_max_retries
+            )
         if self._is_otc_fund(fund_code):
             return await self._get_otc_fund_history(fund_code, days)
-        return await self._get_exchange_fund_history(fund_code, days, adjust)
+        return await self._get_exchange_fund_history(
+            fund_code, days, adjust, max_retries=kline_max_retries
+        )
 
     async def _get_otc_fund_history(
         self,
@@ -561,6 +568,8 @@ class EastMoneyAPI:
         fund_code: str,
         days: int = 30,
         adjust: str = "qfq",
+        *,
+        max_retries: int = 3,
     ) -> Optional[list]:
         """
         获取场内基金（ETF/LOF）历史K线数据
@@ -569,6 +578,7 @@ class EastMoneyAPI:
             fund_code: 基金代码
             days: 获取天数
             adjust: 复权类型
+            max_retries: 传给 _request 的最大重试次数
             
         Returns:
             历史数据列表或 None
@@ -594,7 +604,7 @@ class EastMoneyAPI:
             "lmt": str(days * 3),  # 限制数量
         }
         
-        data = await self._request(self.KLINE_API, params)
+        data = await self._request(self.KLINE_API, params, max_retries=max_retries)
         if data and data.get("rc") == 0:
             result = data.get("data", {})
             klines = result.get("klines", [])

@@ -25,6 +25,16 @@ from .image_generator import render_fund_image, PLAYWRIGHT_AVAILABLE
 # 导入东方财富 API 模块（直接 HTTP 请求，不依赖 akshare）
 from .eastmoney_api import get_api as get_eastmoney_api
 from .fund_code_parse import parse_fund_code_hint
+from .quant_screening import (
+    DEFAULT_SCREENING_CONCURRENCY,
+    DISCLAIMER,
+    MIN_HISTORY_BARS,
+    format_screening_plain,
+    parse_optional_positive_int,
+    rank_screening_rows,
+    screen_lof_funds,
+    screen_stocks_by_abs_pct,
+)
 
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
 DEFAULT_TIMEOUT = 120  # 2分钟
@@ -156,6 +166,7 @@ class FundAnalyzer:
         adjust: str = "qfq",
         *,
         prefer_otc: bool = False,
+        kline_max_retries: int = 3,
     ) -> list[dict] | None:
         """
         获取LOF基金历史行情
@@ -165,6 +176,7 @@ class FundAnalyzer:
             days: 获取天数
             adjust: 复权类型 qfq-前复权, hfq-后复权, ""-不复权
             prefer_otc: 与 get_lof_realtime 一致
+            kline_max_retries: 东财场内 K 线 HTTP 最大尝试次数（见 EastMoneyAPI.get_fund_history）
 
         Returns:
             历史数据列表或 None
@@ -176,7 +188,11 @@ class FundAnalyzer:
 
         try:
             history = await self._api.get_fund_history(
-                fund_code, days, adjust, prefer_otc=prefer_otc
+                fund_code,
+                days,
+                adjust,
+                prefer_otc=prefer_otc,
+                kline_max_retries=kline_max_retries,
             )
             return history
         except Exception as e:
@@ -941,31 +957,54 @@ class FundAnalyzerPlugin(Star):
                 "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            # # 读取模板
-            # template_path = self._data_dir / "templates" / "analysis_report.html"
-            # # 如果不在数据目录，尝试检查插件目录
-            # if not template_path.exists():
-            #     template_path = (
-            #         Path(__file__).parent / "templates" / "analysis_report.html"
-            #     )
+            # 读取模板
+            template_path = self._data_dir / "templates" / "analysis_report.html"
+            # 如果不在数据目录，尝试检查插件目录
+            if not template_path.exists():
+                template_path = (
+                    Path(__file__).parent / "templates" / "analysis_report.html"
+                )
 
-            # if not template_path.exists():
-            #     # 降级到文本模式
-            #     yield event.plain_result(self._format_analysis(info, indicators))
-            #     return
+            if not template_path.exists():
+                yield event.plain_result(self._format_analysis(info, indicators))
+                return
 
-            # with open(template_path, "r", encoding="utf-8") as f:
-            #     template_str = f.read()
+            with open(template_path, "r", encoding="utf-8") as f:
+                template_str = f.read()
 
-            # # 渲染图片
-            # img_url = await self.image_renderer.render_custom_template(
-            #     tmpl_str=template_str, tmpl_data=data, return_url=True
-            # )
-
-            # # 发送图片
-            # yield event.image_result(img_url)
-            yield event.plain_result(self._format_analysis(info, indicators))
-            return
+            if self.use_local_renderer:
+                try:
+                    img_path = await render_fund_image(
+                        template_path=template_path,
+                        template_data=data,
+                        width=480,
+                    )
+                    yield event.image_result(img_path)
+                except Exception as e:
+                    logger.warning(f"基金分析本地渲染失败，尝试网络渲染: {e}")
+                    try:
+                        img_url = await self.image_renderer.render_custom_template(
+                            tmpl_str=template_str,
+                            tmpl_data=data,
+                            return_url=True,
+                        )
+                        yield event.image_result(img_url)
+                    except Exception as e2:
+                        logger.warning(f"基金分析网络渲染失败，降级文本: {e2}")
+                        yield event.plain_result(
+                            self._format_analysis(info, indicators)
+                        )
+            else:
+                try:
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str,
+                        tmpl_data=data,
+                        return_url=True,
+                    )
+                    yield event.image_result(img_url)
+                except Exception as e:
+                    logger.warning(f"基金分析网络渲染失败，降级文本: {e}")
+                    yield event.plain_result(self._format_analysis(info, indicators))
 
         except ImportError:
             yield event.plain_result(
@@ -1507,6 +1546,129 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"智能分析出错: {e}")
             yield event.plain_result(f"❌ 分析失败: {str(e)}")
+
+    @filter.command("量化精选基金")
+    async def quant_screen_funds(
+        self,
+        event: AstrMessageEvent,
+        cap_arg: str = "",
+        top_arg: str = "",
+    ):
+        """
+        对东财场内 LOF 列表批量拉取日线，按综合分排序后输出偏买入方向的标的。
+        用法: 量化精选基金 [分析数量上限] [输出条数]
+        省略参数时分析东财单页 LOF 列表（约≤500 只），默认输出 10 条；仅一个参数时视为分析上限，输出条数仍为 10。
+        示例: 量化精选基金 400 10
+        """
+        try:
+            if not cap_arg.strip() and not top_arg.strip():
+                cap_v, top_n = None, 10
+            elif cap_arg.strip() and not top_arg.strip():
+                cap_v = parse_optional_positive_int(None, cap_arg)
+                top_n = 10
+            else:
+                cap_v = parse_optional_positive_int(None, cap_arg)
+                top_n = parse_optional_positive_int(10, top_arg) or 10
+
+            n_preview = cap_v if cap_v is not None else "全部(单页列表)"
+            yield event.plain_result(
+                f"📊 量化精选基金：准备分析至多 {n_preview} 只，"
+                f"输出 TOP {top_n}（约需数分钟）..."
+            )
+
+            raw, attempted = await screen_lof_funds(
+                self.analyzer, cap=cap_v, max_concurrent=DEFAULT_SCREENING_CONCURRENCY
+            )
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未获取到场内 LOF 列表，请检查网络或稍后重试。"
+                )
+                return
+            ranked = rank_screening_rows(raw)
+            top_rows = ranked[:top_n]
+
+            if not raw:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根），无法排序。"
+                    + DISCLAIMER
+                )
+                return
+
+            text = format_screening_plain(
+                title="📈 场内 LOF 量化精选（综合分由高到低排序）",
+                screened=top_rows,
+                candidate_count=attempted,
+                valid_count=len(raw),
+            )
+            yield event.plain_result(text)
+        except Exception as e:
+            logger.error(f"量化精选基金出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("量化精选股票")
+    async def quant_screen_stocks(
+        self,
+        event: AstrMessageEvent,
+        max_scan_arg: str = "",
+        top_arg: str = "",
+    ):
+        """
+        从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
+        用法: 量化精选股票 [候选只数] [输出条数]
+        默认: 候选150只，输出10条。
+        """
+        try:
+            if not max_scan_arg.strip():
+                max_scan = 150
+                top_n = parse_optional_positive_int(10, top_arg) or 10
+            elif not top_arg.strip():
+                max_scan = parse_optional_positive_int(150, max_scan_arg) or 150
+                top_n = 10
+            else:
+                max_scan = parse_optional_positive_int(150, max_scan_arg) or 150
+                top_n = parse_optional_positive_int(10, top_arg) or 10
+
+            yield event.plain_result(
+                f"📊 量化精选股票：按 |涨跌幅| 取前 {max_scan} 只拉取60日K线，"
+                f"输出 TOP {top_n}（约需数分钟）..."
+            )
+
+            raw, attempted = await screen_stocks_by_abs_pct(
+                self.stock_analyzer,
+                self.analyzer,
+                max_scan=max_scan,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+            )
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未得到行情候选（需 akshare 或涨跌幅/代码列缺失），"
+                    "请检查网络或缩小 max_scan。"
+                )
+                return
+            ranked = rank_screening_rows(raw)
+            top_rows = ranked[:top_n]
+
+            if not raw:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根），无法排序。"
+                    + DISCLAIMER
+                )
+                return
+
+            text = format_screening_plain(
+                title="📈 A股量化精选（|涨跌幅|前筛 + 综合分排序）",
+                screened=top_rows,
+                candidate_count=attempted,
+                valid_count=len(raw),
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare 拉取 A 股行情\n请执行: pip install akshare"
+            )
+        except Exception as e:
+            logger.error(f"量化精选股票出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("量化分析")
     async def quant_analysis(self, event: AstrMessageEvent, code: str = ""):
@@ -2288,7 +2450,9 @@ class FundAnalyzerPlugin(Star):
 🔹 基金 [代码] - 查询基金实时行情
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
-🔹 量化分析 [代码] - 📈专业量化指标分析
+🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
+🔹 量化精选股票 [候选数] [输出条数] - |涨跌幅|前筛+排序（默认150/10，依赖 akshare）
+💡 量化精选会并发拉多档 K 线，若频繁断连多为数据源限流/网络问题，可稍后重试或减小分析数量。
 🔹 智能分析 [代码] - 🤖AI量化深度分析
 🔹 股票智能分析 [代码] - ⚖️多智能体博弈分析
 🔹 基金历史 [代码] [天数] - 查看历史行情
@@ -2308,7 +2472,8 @@ class FundAnalyzerPlugin(Star):
   • 基金 161226
   • 基金分析
   • 基金对比 161226 513100
-  • 量化分析 161226
+  • 量化精选股票 150 10
+  • 量化精选基金 400 10
   • 智能分析 161226
   • 股票智能分析 161226
   • 基金历史 161226 20
@@ -2335,7 +2500,6 @@ class FundAnalyzerPlugin(Star):
 💡 A股数据缓存10分钟，仅供参考
 💡 投资有风险，入市需谨慎！
 """.strip()
-        yield event.plain_result(help_text)
         yield event.plain_result(help_text)
 
     async def terminate(self):
