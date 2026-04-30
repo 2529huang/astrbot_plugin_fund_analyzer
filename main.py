@@ -6,6 +6,7 @@ AstrBot 基金数据分析插件
 
 import asyncio
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,23 @@ from astrbot.core.utils.t2i.renderer import HtmlRenderer
 
 # 导入股票分析模块
 from .stock import StockAnalyzer, StockInfo
+from .stock.board_ak import (
+    fetch_concept_cons,
+    fetch_concept_names_df,
+    fetch_etf_spot_df,
+    fetch_industry_cons,
+    fetch_industry_names_df,
+    filter_board_names_by_keyword,
+    filter_etf_by_keyword,
+)
+
+from .command_parse import (
+    DEFAULT_BOARD_DISPLAY_LIMIT,
+    get_event_plain_text,
+    parse_keyword_and_limit,
+    parse_name_maxscan_top,
+    strip_command_prefix,
+)
 
 # 导入本地图片生成器
 from .image_generator import render_fund_image, PLAYWRIGHT_AVAILABLE
@@ -30,10 +48,13 @@ from .quant_screening import (
     DISCLAIMER,
     MIN_HISTORY_BARS,
     format_screening_plain,
+    pairs_from_board_like_df,
     parse_optional_positive_int,
     rank_screening_rows,
+    screen_board_like_pairs,
     screen_lof_funds,
     screen_stocks_by_abs_pct,
+    screening_report_template_data,
 )
 
 # 默认超时时间（秒）- AKShare获取LOF数据需要较长时间
@@ -520,6 +541,107 @@ class FundAnalyzerPlugin(Star):
 💡 数据缓存10分钟，仅供参考
 """.strip()
 
+    def _resolve_screening_template_path(self) -> Optional[Path]:
+        fn = "screening_report.html"
+        p = self._data_dir / "templates" / fn
+        if p.exists():
+            return p
+        p2 = Path(__file__).parent / "templates" / fn
+        return p2 if p2.exists() else None
+
+    async def _emit_screening_report(
+        self,
+        event: AstrMessageEvent,
+        *,
+        title: str,
+        top_rows: list,
+        candidate_count: int,
+        valid_count: int,
+    ):
+        text_fallback = format_screening_plain(
+            title=title,
+            screened=top_rows,
+            candidate_count=candidate_count,
+            valid_count=valid_count,
+        )
+        tpl = self._resolve_screening_template_path()
+        if tpl is None:
+            yield event.plain_result(text_fallback)
+            return
+        data = screening_report_template_data(
+            title=title,
+            screened=top_rows,
+            candidate_count=candidate_count,
+            valid_count=valid_count,
+        )
+        with open(tpl, encoding="utf-8") as f:
+            template_str = f.read()
+        if self.use_local_renderer:
+            try:
+                img_path = await render_fund_image(
+                    template_path=tpl,
+                    template_data=data,
+                    width=540,
+                )
+                yield event.image_result(img_path)
+                return
+            except Exception as e:
+                logger.warning(f"量化精选本地渲染失败，尝试网络渲染: {e}")
+                try:
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str,
+                        tmpl_data=data,
+                        return_url=True,
+                    )
+                    yield event.image_result(img_url)
+                    return
+                except Exception as e2:
+                    logger.warning(f"量化精选网络渲染失败，降级文本: {e2}")
+                    yield event.plain_result(text_fallback)
+                    return
+        try:
+            img_url = await self.image_renderer.render_custom_template(
+                tmpl_str=template_str,
+                tmpl_data=data,
+                return_url=True,
+            )
+            yield event.image_result(img_url)
+        except Exception as e:
+            logger.warning(f"量化精选网络渲染失败，降级文本: {e}")
+            yield event.plain_result(text_fallback)
+
+    async def _board_quant_pipeline(
+        self,
+        event: AstrMessageEvent,
+        *,
+        title: str,
+        pairs: list,
+        top_n: int,
+    ):
+        attempted = len(pairs)
+        if attempted == 0:
+            yield event.plain_result("⚠️ 无有效证券代码可分析。")
+            return
+        raw = await screen_board_like_pairs(
+            self.analyzer, pairs, max_concurrent=DEFAULT_SCREENING_CONCURRENCY
+        )
+        if not raw:
+            yield event.plain_result(
+                f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根），无法排序。"
+                + DISCLAIMER
+            )
+            return
+        ranked = rank_screening_rows(raw)
+        top_rows = ranked[:top_n]
+        async for msg in self._emit_screening_report(
+            event,
+            title=title,
+            top_rows=top_rows,
+            candidate_count=attempted,
+            valid_count=len(raw),
+        ):
+            yield msg
+
     async def _fetch_precious_metal_prices(self) -> dict:
         """
         从NowAPI获取上海黄金交易所贵金属价格
@@ -699,6 +821,93 @@ class FundAnalyzerPlugin(Star):
 
         return "\n".join(lines)
 
+    _BOARD_NOTE = "⚠️ 以上内容仅供参考，不构成投资建议。"
+
+    @staticmethod
+    def _fmt_num_cell(v: Any, fmt: str, default: str = "-") -> str:
+        try:
+            x = float(v)
+            if math.isnan(x):
+                return default
+            return fmt % x
+        except (TypeError, ValueError):
+            return default
+
+    def _format_board_cons_plain(
+        self, df: Any, display_limit: int, header: str
+    ) -> str:
+        total = len(df)
+        n = min(display_limit, total)
+        sub = df.iloc[:n]
+        lines = [
+            header,
+            f"全量 {total} 只，下列展示 {n} 只",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+        for i in range(n):
+            row = sub.iloc[i]
+            code = str(row.get("代码", "") or "").strip()
+            name = str(row.get("名称", "") or "").strip()
+            price = self._fmt_num_cell(row.get("最新价"), "%.3f")
+            pct = self._fmt_num_cell(row.get("涨跌幅"), "%+.2f%%")
+            lines.append(f"{i + 1}. {name} ({code})  {price}  {pct}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("💡 使用「股票 代码」查看单只行情")
+        lines.append(self._BOARD_NOTE)
+        return "\n".join(lines)
+
+    def _format_board_name_hits_plain(
+        self, df: Any, display_limit: int, header: str
+    ) -> str:
+        total = len(df)
+        n = min(display_limit, total)
+        sub = df.iloc[:n]
+        lines = [
+            header,
+            f"命中 {total} 个板块，下列展示 {n} 个",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+        name_col = "板块名称" if "板块名称" in sub.columns else None
+        code_col = "板块代码" if "板块代码" in sub.columns else None
+        pct_col = "涨跌幅" if "涨跌幅" in sub.columns else None
+        for i in range(n):
+            row = sub.iloc[i]
+            nm = str(row.get(name_col, "") or "").strip() if name_col else ""
+            cd = str(row.get(code_col, "") or "").strip() if code_col else ""
+            pct = (
+                self._fmt_num_cell(row.get(pct_col), "%+.2f%%")
+                if pct_col
+                else "-"
+            )
+            lines.append(f"{i + 1}. {nm} ({cd})  {pct}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("💡 复制准确板块名后使用「板块概念」或「板块行业」")
+        lines.append(self._BOARD_NOTE)
+        return "\n".join(lines)
+
+    def _format_etf_hits_plain(
+        self, df: Any, display_limit: int, header: str
+    ) -> str:
+        total = len(df)
+        n = min(display_limit, total)
+        sub = df.iloc[:n]
+        lines = [
+            header,
+            f"命中 {total} 只，下列展示 {n} 只",
+            "━━━━━━━━━━━━━━━━━",
+        ]
+        for i in range(n):
+            row = sub.iloc[i]
+            code = str(row.get("代码", "") or "").strip()
+            name = str(row.get("名称", "") or "").strip()
+            price = self._fmt_num_cell(row.get("最新价"), "%.3f")
+            pct = self._fmt_num_cell(row.get("涨跌幅"), "%+.2f%%")
+            lines.append(f"{i + 1}. {name} ({code})  {price}  {pct}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("💡 使用「基金 代码」查看场内基金行情（六位代码）")
+        lines.append(self._BOARD_NOTE)
+        return "\n".join(lines)
+
     @filter.command("今日行情")
     async def today_market(self, event: AstrMessageEvent):
         """
@@ -814,6 +1023,362 @@ class FundAnalyzerPlugin(Star):
         except Exception as e:
             logger.error(f"搜索股票出错: {e}")
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
+
+    @filter.command("板块概念")
+    async def board_concept_cons_cmd(self, event: AstrMessageEvent):
+        """
+        东方财富概念板块成份股。
+        板块概念 <名称> [展示条数]
+        """
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "板块概念")
+            name, limit = parse_keyword_and_limit(
+                tail, default_limit=DEFAULT_BOARD_DISPLAY_LIMIT
+            )
+            if not name:
+                yield event.plain_result(
+                    "❌ 请输入东财概念板块名称\n"
+                    "💡 用法: 板块概念 <名称> [展示条数]\n"
+                    "💡 示例: 板块概念 车联网 50\n"
+                    "💡 不知准确名称时可先用「搜索板块概念 关键词」"
+                )
+                return
+            yield event.plain_result(f"🔍 正在拉取概念「{name}」成份股…")
+            df = await fetch_concept_cons(name)
+            if df is None:
+                yield event.plain_result(
+                    f"❌ 未找到概念「{name}」或暂无成份数据。\n"
+                    "💡 请用「搜索板块概念」核对与东财一致的板块名称，"
+                    "亦可用 BK 开头的板块代码。"
+                )
+                return
+            out = self._format_board_cons_plain(
+                df, limit, f"📗 概念板块「{name}」成份"
+            )
+            yield event.plain_result(out)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试或缩短展示条数"
+            )
+        except Exception as e:
+            logger.error(f"板块概念出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("板块行业")
+    async def board_industry_cons_cmd(self, event: AstrMessageEvent):
+        """
+        东方财富行业板块成份股。
+        板块行业 <名称> [展示条数]
+        """
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "板块行业")
+            name, limit = parse_keyword_and_limit(
+                tail, default_limit=DEFAULT_BOARD_DISPLAY_LIMIT
+            )
+            if not name:
+                yield event.plain_result(
+                    "❌ 请输入东财行业板块名称\n"
+                    "💡 用法: 板块行业 <名称> [展示条数]\n"
+                    "💡 示例: 板块行业 小金属 40\n"
+                    "💡 不知准确名称时可先用「搜索板块行业 关键词」"
+                )
+                return
+            yield event.plain_result(f"🔍 正在拉取行业「{name}」成份股…")
+            df = await fetch_industry_cons(name)
+            if df is None:
+                yield event.plain_result(
+                    f"❌ 未找到行业「{name}」或暂无成份数据。\n"
+                    "💡 请用「搜索板块行业」核对与东财一致的板块名称，"
+                    "亦可用 BK 开头的板块代码。"
+                )
+                return
+            out = self._format_board_cons_plain(
+                df, limit, f"📘 行业板块「{name}」成份"
+            )
+            yield event.plain_result(out)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试或缩短展示条数"
+            )
+        except Exception as e:
+            logger.error(f"板块行业出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("搜索板块概念")
+    async def search_board_concept_cmd(self, event: AstrMessageEvent):
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "搜索板块概念")
+            kw, limit = parse_keyword_and_limit(
+                tail, default_limit=DEFAULT_BOARD_DISPLAY_LIMIT
+            )
+            if not kw:
+                yield event.plain_result(
+                    "❌ 请输入关键词\n"
+                    "💡 用法: 搜索板块概念 <关键词> [展示条数]\n"
+                    "💡 示例: 搜索板块概念 芯片 30"
+                )
+                return
+            yield event.plain_result(f"🔍 正在匹配概念板块「{kw}」…")
+            base = await fetch_concept_names_df()
+            if base is None:
+                yield event.plain_result("❌ 未能获取概念板块列表，请稍后再试")
+                return
+            hit = filter_board_names_by_keyword(base, kw)
+            if hit is None or len(hit) == 0:
+                yield event.plain_result(f"❌ 未匹配到含「{kw}」的概念板块")
+                return
+            out = self._format_board_name_hits_plain(
+                hit, limit, f"🔎 概念板块搜索「{kw}」"
+            )
+            yield event.plain_result(out)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试"
+            )
+        except Exception as e:
+            logger.error(f"搜索板块概念出错: {e}")
+            yield event.plain_result(f"❌ 搜索失败: {e}")
+
+    @filter.command("搜索板块行业")
+    async def search_board_industry_cmd(self, event: AstrMessageEvent):
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "搜索板块行业")
+            kw, limit = parse_keyword_and_limit(
+                tail, default_limit=DEFAULT_BOARD_DISPLAY_LIMIT
+            )
+            if not kw:
+                yield event.plain_result(
+                    "❌ 请输入关键词\n"
+                    "💡 用法: 搜索板块行业 <关键词> [展示条数]\n"
+                    "💡 示例: 搜索板块行业 电力 30"
+                )
+                return
+            yield event.plain_result(f"🔍 正在匹配行业板块「{kw}」…")
+            base = await fetch_industry_names_df()
+            if base is None:
+                yield event.plain_result("❌ 未能获取行业板块列表，请稍后再试")
+                return
+            hit = filter_board_names_by_keyword(base, kw)
+            if hit is None or len(hit) == 0:
+                yield event.plain_result(f"❌ 未匹配到含「{kw}」的行业板块")
+                return
+            out = self._format_board_name_hits_plain(
+                hit, limit, f"🔎 行业板块搜索「{kw}」"
+            )
+            yield event.plain_result(out)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试"
+            )
+        except Exception as e:
+            logger.error(f"搜索板块行业出错: {e}")
+            yield event.plain_result(f"❌ 搜索失败: {e}")
+
+    @filter.command("搜索ETF")
+    async def search_etf_cmd(self, event: AstrMessageEvent):
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "搜索ETF")
+            kw, limit = parse_keyword_and_limit(
+                tail, default_limit=DEFAULT_BOARD_DISPLAY_LIMIT
+            )
+            if not kw:
+                yield event.plain_result(
+                    "❌ 请输入关键词（名称或代码子串）\n"
+                    "💡 用法: 搜索ETF <关键词> [展示条数]\n"
+                    "💡 示例: 搜索ETF 红利 25"
+                )
+                return
+            yield event.plain_result(f"🔍 正在筛选场内 ETF「{kw}」…")
+            base = await fetch_etf_spot_df()
+            if base is None:
+                yield event.plain_result("❌ 未能获取 ETF 列表，请稍后再试")
+                return
+            hit = filter_etf_by_keyword(base, kw)
+            if hit is None or len(hit) == 0:
+                yield event.plain_result(f"❌ 未匹配到含「{kw}」的 ETF")
+                return
+            out = self._format_etf_hits_plain(hit, limit, f"🔎 ETF 搜索「{kw}」")
+            yield event.plain_result(out)
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试"
+            )
+        except Exception as e:
+            logger.error(f"搜索ETF出错: {e}")
+            yield event.plain_result(f"❌ 搜索失败: {e}")
+
+    @filter.command("板块量化概念")
+    async def board_quant_concept_cmd(self, event: AstrMessageEvent):
+        """
+        概念板块成份拉日线后按综合分排序（|涨跌幅|优先取样）。
+        板块量化概念 <名称> [分析上限] [输出条数]
+        """
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "板块量化概念")
+            name, max_scan, top_n = parse_name_maxscan_top(tail)
+            if not name:
+                yield event.plain_result(
+                    "❌ 请输入东财概念板块名称\n"
+                    "💡 用法: 板块量化概念 <名称> [分析上限] [输出条数]\n"
+                    "💡 默认分析至多 80 只成份、输出 TOP 10；双数字依次为分析上限与输出条数。\n"
+                    "💡 示例: 板块量化概念 车联网 40 5\n"
+                    "💡 不知准确名称时可先用「搜索板块概念」"
+                )
+                return
+            yield event.plain_result(
+                f"📊 概念「{name}」：将分析至多 {max_scan} 只成份、输出 TOP {top_n}（约需数分钟）…"
+            )
+            df = await fetch_concept_cons(name)
+            if df is None:
+                yield event.plain_result(
+                    f"❌ 未找到概念「{name}」或暂无成份数据。\n"
+                    "💡 请用「搜索板块概念」核对与东财一致的板块名称。"
+                )
+                return
+            pairs = pairs_from_board_like_df(df, max_scan)
+            async for msg in self._board_quant_pipeline(
+                event,
+                title=f"📈 概念板块「{name}」成份量化排序（|涨跌幅|优先取样）",
+                pairs=pairs,
+                top_n=top_n,
+            ):
+                yield msg
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试或减少分析上限"
+            )
+        except Exception as e:
+            logger.error(f"板块量化概念出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("板块量化行业")
+    async def board_quant_industry_cmd(self, event: AstrMessageEvent):
+        """
+        行业板块成份拉日线后按综合分排序（|涨跌幅|优先取样）。
+        """
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "板块量化行业")
+            name, max_scan, top_n = parse_name_maxscan_top(tail)
+            if not name:
+                yield event.plain_result(
+                    "❌ 请输入东财行业板块名称\n"
+                    "💡 用法: 板块量化行业 <名称> [分析上限] [输出条数]\n"
+                    "💡 默认分析至多 80 只成份、输出 TOP 10。\n"
+                    "💡 示例: 板块量化行业 半导体 50 8\n"
+                    "💡 不知准确名称时可先用「搜索板块行业」"
+                )
+                return
+            yield event.plain_result(
+                f"📊 行业「{name}」：将分析至多 {max_scan} 只成份、输出 TOP {top_n}（约需数分钟）…"
+            )
+            df = await fetch_industry_cons(name)
+            if df is None:
+                yield event.plain_result(
+                    f"❌ 未找到行业「{name}」或暂无成份数据。\n"
+                    "💡 请用「搜索板块行业」核对与东财一致的板块名称。"
+                )
+                return
+            pairs = pairs_from_board_like_df(df, max_scan)
+            async for msg in self._board_quant_pipeline(
+                event,
+                title=f"📈 行业板块「{name}」成份量化排序（|涨跌幅|优先取样）",
+                pairs=pairs,
+                top_n=top_n,
+            ):
+                yield msg
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试或减少分析上限"
+            )
+        except Exception as e:
+            logger.error(f"板块量化行业出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("板块量化ETF")
+    async def board_quant_etf_cmd(self, event: AstrMessageEvent):
+        """
+        在 fund_etf_spot_em 中按名称/代码子串筛选 ETF，再批量量化排序（非严格指数/概念成份）。
+        """
+        try:
+            text = get_event_plain_text(event)
+            tail = strip_command_prefix(text, "板块量化ETF")
+            kw, max_scan, top_n = parse_name_maxscan_top(tail)
+            if not kw:
+                yield event.plain_result(
+                    "❌ 请输入关键词（ETF 简称或代码子串，常与板块名相同）\n"
+                    "💡 用法: 板块量化ETF <关键词> [分析上限] [输出条数]\n"
+                    "💡 默认分析至多 80 只、输出 TOP 10；结果为名称匹配筛选，非严格板块成份。\n"
+                    "💡 示例: 板块量化ETF 红利 30 5"
+                )
+                return
+            yield event.plain_result(
+                f"📊 ETF 关键词「{kw}」：将分析至多 {max_scan} 只、输出 TOP {top_n}（约需数分钟）…"
+            )
+            base = await fetch_etf_spot_df()
+            if base is None:
+                yield event.plain_result("❌ 未能获取 ETF 列表，请稍后再试")
+                return
+            hit = filter_etf_by_keyword(base, kw)
+            if hit is None or len(hit) == 0:
+                yield event.plain_result(
+                    f"❌ 未匹配到名称或代码含「{kw}」的场内 ETF。\n"
+                    "💡 可先用「搜索ETF」试其他关键词。"
+                )
+                return
+            pairs = pairs_from_board_like_df(hit, max_scan)
+            async for msg in self._board_quant_pipeline(
+                event,
+                title=f"📈 场内 ETF「{kw}」名称匹配 · 量化排序（非严格成份）",
+                pairs=pairs,
+                top_n=top_n,
+            ):
+                yield msg
+        except ImportError:
+            yield event.plain_result(
+                "❌ AKShare 库未安装\n请管理员执行: pip install akshare"
+            )
+        except TimeoutError:
+            yield event.plain_result(
+                "⏰ 东财接口超时\n💡 请稍后再试或减少分析上限"
+            )
+        except Exception as e:
+            logger.error(f"板块量化ETF出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("基金")
     async def fund_query(self, event: AstrMessageEvent, code: str = ""):
@@ -1594,13 +2159,14 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
-            text = format_screening_plain(
+            async for msg in self._emit_screening_report(
+                event,
                 title="📈 场内 LOF 量化精选（综合分由高到低排序）",
-                screened=top_rows,
+                top_rows=top_rows,
                 candidate_count=attempted,
                 valid_count=len(raw),
-            )
-            yield event.plain_result(text)
+            ):
+                yield msg
         except Exception as e:
             logger.error(f"量化精选基金出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
@@ -1655,13 +2221,14 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
-            text = format_screening_plain(
+            async for msg in self._emit_screening_report(
+                event,
                 title="📈 A股量化精选（|涨跌幅|前筛 + 综合分排序）",
-                screened=top_rows,
+                top_rows=top_rows,
                 candidate_count=attempted,
                 valid_count=len(raw),
-            )
-            yield event.plain_result(text)
+            ):
+                yield msg
         except ImportError as e:
             yield event.plain_result(
                 "❌ 需要 akshare 拉取 A 股行情\n请执行: pip install akshare"
@@ -2446,13 +3013,26 @@ class FundAnalyzerPlugin(Star):
 🔹 股票 <代码> - 查询A股实时行情
 🔹 搜索股票 关键词 - 搜索A股股票
 ━━━━━━━━━━━━━━━━━
+📂 东财板块成分 / 场内 ETF (AKShare，多词名保留空格；末尾可选数字为展示条数，默认40、最大200):
+🔹 板块概念 <名称> [条数] - 概念板块成份（含行情列）
+🔹 板块行业 <名称> [条数] - 行业板块成份
+🔹 搜索板块概念 <关键词> [条数] - 子串匹配概念板块名，便于核对东财准确名称
+🔹 搜索板块行业 <关键词> [条数] - 子串匹配行业板块名
+🔹 搜索ETF <关键词> [条数] - 场内 ETF 简称/代码筛选
+🔹 板块量化概念 <名称> [分析上限] [输出条数] - 成份股批量量化排序（默认80/10，|涨跌幅|优先取样）
+🔹 板块量化行业 <名称> [分析上限] [输出条数] - 同上（行业成份）
+🔹 板块量化ETF <关键词> [分析上限] [输出条数] - ETF 列表名称/代码子串匹配后量化排序（非严格板块成份）
+💡 成份为空或报错时，先用「搜索板块*」确认与数据源完全一致的板块名。
+💡 板块量化输出与「量化精选」相同（图/文 + 免责声明）；批量拉 K 线可能较慢或受限速。
+━━━━━━━━━━━━━━━━━
 📊 LOF基金功能:
 🔹 基金 [代码] - 查询基金实时行情
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
 🔹 量化精选股票 [候选数] [输出条数] - |涨跌幅|前筛+排序（默认150/10，依赖 akshare）
-💡 量化精选会并发拉多档 K 线，若频繁断连多为数据源限流/网络问题，可稍后重试或减小分析数量。
+💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
+💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
 🔹 智能分析 [代码] - 🤖AI量化深度分析
 🔹 股票智能分析 [代码] - ⚖️多智能体博弈分析
 🔹 基金历史 [代码] [天数] - 查看历史行情
@@ -2469,6 +3049,14 @@ class FundAnalyzerPlugin(Star):
   • 今日行情 (金银价格)
   • 股票 000001 (平安银行)
   • 搜索股票 茅台
+  • 板块概念 车联网 50
+  • 搜索板块概念 芯片 30
+  • 板块行业 半导体 30
+  • 搜索板块行业 白酒 20
+  • 搜索ETF 红利 40
+  • 板块量化概念 车联网 30 5
+  • 板块量化行业 半导体 40 8
+  • 板块量化ETF 红利 25 5
   • 基金 161226
   • 基金分析
   • 基金对比 161226 513100

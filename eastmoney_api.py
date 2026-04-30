@@ -6,10 +6,13 @@
 
 import asyncio
 import json
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Optional
+
 import aiohttp
+import pandas as pd
 import random
 
 from astrbot.api import logger
@@ -45,6 +48,9 @@ HEADERS_LIST = [
 # 超时设置
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=15, sock_read=20)
 
+# quote.eastmoney.com 行情中心 clist 抓包 ut（与浏览器一致）
+EM_WEB_CLIST_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+
 
 class EastMoneyAPI:
     """东方财富数据 API 封装"""
@@ -71,6 +77,8 @@ class EastMoneyAPI:
     FUND_FLOW_API = "http://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
     # 资金流向备用源 - 东方财富 datacenter
     FUND_FLOW_DETAIL_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    # 行业板块列表 / 成份（与网页 push2.eastmoney.com/api/qt/clist/get 抓包一致）
+    PUSH2_CLIST_GET = "https://push2.eastmoney.com/api/qt/clist/get"
 
     def __init__(self):
         # 缓存
@@ -104,6 +112,25 @@ class EastMoneyAPI:
             await self._session.close()
             self._session = None
 
+    @staticmethod
+    def _loads_eastmoney_body(text: str) -> Optional[dict]:
+        """解析纯 JSON 或 JSONP（如 jQueryxxx({...})）。"""
+        text = (text or "").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        try:
+            lb = text.find("(")
+            rb = text.rfind(")")
+            if lb != -1 and rb > lb:
+                return json.loads(text[lb + 1 : rb])
+        except json.JSONDecodeError:
+            pass
+        return None
+
     async def _request(
         self,
         url: str,
@@ -132,13 +159,11 @@ class EastMoneyAPI:
                 
                 async with session.get(url, params=params, headers=headers) as response:
                     if response.status == 200:
-                        # 有些 API 返回 text/plain，需要手动解析 JSON
                         text = await response.text()
-                        try:
-                            return json.loads(text)
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"JSON 解析失败: {e}")
-                            return None
+                        data = self._loads_eastmoney_body(text)
+                        if data is None:
+                            logger.warning("JSON/JSONP 解析失败")
+                        return data
                     else:
                         logger.warning(f"HTTP {response.status}: {url}")
             except aiohttp.ServerDisconnectedError:
@@ -161,6 +186,184 @@ class EastMoneyAPI:
                 await asyncio.sleep(wait_time)
         
         return None
+
+    async def _fetch_clist_paginated_df(
+        self,
+        url: str,
+        base_params: dict,
+    ) -> Optional[pd.DataFrame]:
+        """
+        东财 push2 clist 分页拉取，排序与列处理同 akshare.fetch_paginated_data。
+        """
+        params = dict(base_params)
+        params.setdefault("pn", "1")
+        first = await self._request(url, params)
+        if not first or not isinstance(first.get("data"), dict):
+            return None
+        data = first["data"]
+        diff = data.get("diff")
+        if diff is None:
+            return None
+        if len(diff) == 0:
+            return pd.DataFrame()
+        total = int(data.get("total") or 0)
+        per_page = len(diff)
+        frames = [pd.DataFrame(diff)]
+        total_page = max(1, math.ceil(total / per_page)) if per_page else 1
+
+        for page in range(2, total_page + 1):
+            params = dict(base_params)
+            params["pn"] = str(page)
+            await asyncio.sleep(random.uniform(0.3, 0.9))
+            js = await self._request(url, params)
+            if not js or not isinstance(js.get("data"), dict):
+                break
+            d2 = js["data"].get("diff") or []
+            if not d2:
+                break
+            frames.append(pd.DataFrame(d2))
+
+        temp_df = pd.concat(frames, ignore_index=True)
+        if "f3" in temp_df.columns:
+            temp_df["f3"] = pd.to_numeric(temp_df["f3"], errors="coerce")
+            temp_df.sort_values(
+                by=["f3"], ascending=False, inplace=True, ignore_index=True
+            )
+        temp_df.reset_index(inplace=True)
+        temp_df["index"] = temp_df["index"].astype(int) + 1
+        return temp_df
+
+    async def get_stock_board_industry_name_em(self) -> Optional[pd.DataFrame]:
+        """东方财富行业板块名称列表（query 与 quote 页 clist 抓包一致）。"""
+        params = {
+            "np": "1",
+            "fltt": "1",
+            "invt": "2",
+            "fs": "m:90+t:2+f:!50",
+            "fields": "f12,f13,f14,f1,f2,f4,f3,f152,f20,f8,f104,f105,f128,f140,f141,"
+            "f207,f208,f209,f136,f222",
+            "fid": "f3",
+            "pn": "1",
+            "pz": "100",
+            "po": "1",
+            "dect": "1",
+            "ut": EM_WEB_CLIST_UT,
+        }
+        temp_df = await self._fetch_clist_paginated_df(self.PUSH2_CLIST_GET, params)
+        if temp_df is None or len(temp_df) == 0:
+            return None
+        # index + 上列 fields 顺序；板块列表 f12/f14 为代码与名称
+        cols = {
+            "index": "排名",
+            "f12": "板块代码",
+            "f14": "板块名称",
+            "f2": "最新价",
+            "f4": "涨跌额",
+            "f3": "涨跌幅",
+            "f20": "总市值",
+            "f8": "换手率",
+            "f104": "上涨家数",
+            "f105": "下跌家数",
+            "f128": "领涨股票",
+            "f136": "领涨股票-涨跌幅",
+        }
+        miss = [k for k in cols if k not in temp_df.columns]
+        if miss:
+            logger.warning(f"行业板块列表响应缺少字段: {miss}")
+            return None
+        out = pd.DataFrame({v: temp_df[k] for k, v in cols.items()})
+        for c in (
+            "最新价",
+            "涨跌额",
+            "涨跌幅",
+            "总市值",
+            "换手率",
+            "上涨家数",
+            "下跌家数",
+            "领涨股票-涨跌幅",
+        ):
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        # fltt=1：clist 中涨跌幅类为「百分数×100」（如 368 表示 3.68%）
+        for c in ("涨跌幅", "领涨股票-涨跌幅"):
+            out[c] = out[c] / 100.0
+        return out
+
+    async def get_stock_board_industry_cons_em(self, symbol: str) -> Optional[pd.DataFrame]:
+        """东方财富行业板块成份股（列与 akshare.stock_board_industry_cons_em 一致）。"""
+        sym = (symbol or "").strip()
+        if not sym:
+            return None
+        if re.match(r"^BK\d+", sym):
+            stock_board_code = sym
+        else:
+            names_df = await self.get_stock_board_industry_name_em()
+            if names_df is None or len(names_df) == 0:
+                return None
+            matched = names_df[names_df["板块名称"] == sym]
+            if matched.empty:
+                raise IndexError("industry board name not found")
+            stock_board_code = matched["板块代码"].values[0]
+
+        params = {
+            "np": "1",
+            "fltt": "1",
+            "invt": "2",
+            "fid": "f3",
+            "pn": "1",
+            "pz": "100",
+            "po": "1",
+            "dect": "1",
+            "ut": EM_WEB_CLIST_UT,
+            "fs": f"b:{stock_board_code}+f:!50",
+            "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,"
+            "f23,f24,f25,f22,f11,f62,f128,f136,f115,f152,f45",
+        }
+        temp_df = await self._fetch_clist_paginated_df(self.PUSH2_CLIST_GET, params)
+        if temp_df is None or len(temp_df) == 0:
+            return None
+        # push2 clist：个股 f12=代码，f13=市场，f14=名称（勿将 f13 当代码，否则 0/1 → 000000/000001）
+        cols = {
+            "index": "序号",
+            "f12": "代码",
+            "f14": "名称",
+            "f2": "最新价",
+            "f3": "涨跌幅",
+            "f4": "涨跌额",
+            "f5": "成交量",
+            "f6": "成交额",
+            "f7": "振幅",
+            "f16": "最高",
+            "f17": "最低",
+            "f18": "今开",
+            "f20": "昨收",
+            "f8": "换手率",
+            "f9": "市盈率-动态",
+            "f25": "市净率",
+        }
+        miss = [k for k in cols if k not in temp_df.columns]
+        if miss:
+            logger.warning(f"行业成份响应缺少字段: {miss}")
+            return None
+        out = pd.DataFrame({v: temp_df[k] for k, v in cols.items()})
+        for c in (
+            "最新价",
+            "涨跌幅",
+            "涨跌额",
+            "成交量",
+            "成交额",
+            "振幅",
+            "最高",
+            "最低",
+            "今开",
+            "昨收",
+            "换手率",
+            "市盈率-动态",
+            "市净率",
+        ):
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        for c in ("涨跌幅", "振幅"):
+            out[c] = out[c] / 100.0
+        return out
 
     def _get_market_code(self, fund_code: str) -> str:
         """

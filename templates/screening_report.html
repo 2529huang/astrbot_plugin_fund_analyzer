@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>量化精选报告</title>
+    <style>
+        /* html/body 铺满截图视口宽度，否则 fit-content 比视口窄时右边会整块留白 */
+        html {
+            margin: 0;
+            padding: 0;
+            height: fit-content;
+        }
+        body {
+            font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            margin: 0;
+            padding: 0;
+            color: #333;
+            background-color: #ffffff;
+            width: 100%;
+            min-width: 100%;
+            box-sizing: border-box;
+        }
+        .container {
+            background-color: #ffffff;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+            box-sizing: border-box;
+        }
+        .header {
+            background: linear-gradient(135deg, #2f54eb 0%, #597ef7 100%);
+            color: white;
+            padding: 16px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 18px;
+            font-weight: 600;
+            line-height: 1.35;
+        }
+        .header p.meta {
+            margin: 10px 0 0;
+            opacity: 0.92;
+            font-size: 12px;
+        }
+        .header p.time {
+            margin: 6px 0 0;
+            opacity: 0.85;
+            font-size: 11px;
+        }
+        .table-wrap {
+            padding: 12px 12px 4px;
+        }
+        table.screening {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            table-layout: fixed;
+        }
+        table.screening th {
+            background-color: #fafafa;
+            color: #888;
+            font-weight: normal;
+            padding: 10px 6px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+        table.screening td {
+            padding: 10px 6px;
+            border-bottom: 1px solid #f0f0f0;
+            text-align: center;
+            vertical-align: middle;
+        }
+        table.screening td.name-cell {
+            text-align: left;
+            width: 28%;
+            max-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        table.screening td.code-cell {
+            font-weight: 600;
+            color: #2f54eb;
+        }
+        table.screening td.score-cell {
+            font-weight: 600;
+        }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: white;
+            font-weight: normal;
+            white-space: nowrap;
+        }
+        .bg-red { background-color: #f5222d; }
+        .bg-green { background-color: #52c41a; }
+        .bg-blue { background-color: #1890ff; }
+        .bg-orange { background-color: #fa8c16; }
+        .bg-gray { background-color: #d9d9d9; color: #595959; }
+        .disclaimer {
+            padding: 12px 16px 18px;
+            font-size: 11px;
+            color: #8c8c8c;
+            line-height: 1.55;
+            border-top: 1px solid #f0f0f0;
+            background: #fafafa;
+        }
+        .disclaimer p {
+            margin: 0 0 6px;
+        }
+        .disclaimer p:last-child {
+            margin-bottom: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{{ report_title }}</h1>
+            <p class="meta">{{ meta_line }}</p>
+            <p class="time">生成时间: {{ generated_time }}</p>
+        </div>
+        <div class="table-wrap">
+            <table class="screening">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>代码</th>
+                        <th>名称</th>
+                        <th>综合分</th>
+                        <th>信号</th>
+                        <th>夏普</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in rows %}
+                    <tr>
+                        <td>{{ r.rank }}</td>
+                        <td class="code-cell">{{ r.code }}</td>
+                        <td class="name-cell" title="{{ r.name_full }}">{{ r.name }}</td>
+                        <td class="score-cell">{{ r.trend_score }}</td>
+                        <td><span class="badge {{ r.badge_class }}">{{ r.signal }}</span></td>
+                        <td>{{ r.sharpe }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <div class="disclaimer">
+            {% for line in disclaimer_lines %}
+            <p>{{ line }}</p>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>
