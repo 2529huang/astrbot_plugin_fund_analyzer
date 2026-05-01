@@ -19,6 +19,11 @@ from astrbot.core.utils.t2i.renderer import HtmlRenderer
 
 # 导入股票分析模块
 from .stock import StockAnalyzer, StockInfo
+from .stock.day_trip import (
+    filter_spot_for_day_trip,
+    format_day_trip_report,
+    run_day_trip_full,
+)
 from .stock.board_ak import (
     fetch_concept_cons,
     fetch_concept_names_df,
@@ -2237,6 +2242,82 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"量化精选股票出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
+    @filter.command("股票一日游")
+    async def stock_day_trip(self, event: AstrMessageEvent, top_arg: str = ""):
+        """
+        涨跌幅 3%~9% 且量比>1.5（无量比列时用成交量自建近似）→ 日线综合分前 20% → 分时 VWAP/尾盘急拉/触板回落。
+        用法: 股票一日游 [展示条数]，默认 15，最大 50。
+        """
+        try:
+            top_n = parse_optional_positive_int(15, top_arg) or 15
+            top_n = max(1, min(50, top_n))
+
+            yield event.plain_result(
+                "📊 股票一日游：快照硬筛（涨跌幅 3%~9%、量比>1.5；无量比列时用成交量自建近似）"
+                "→ 日线综合分前 20% → 分时验证…\n"
+                "⏳ 正在获取全市场 A 股行情…"
+            )
+
+            df = await self.stock_analyzer._get_stock_data()
+
+            pairs, meta, vr_approx = filter_spot_for_day_trip(df)
+            if not pairs:
+                approx_hint = ""
+                if vr_approx:
+                    approx_hint = (
+                        "\n💡 已用成交量中位数自建近似量比筛选用，"
+                        "非行情软件原生量比。"
+                    )
+                yield event.plain_result(
+                    "⚠️ 硬筛无符合条件的标的（3%~9%、量比>1.5、排除无量/B 股）。"
+                    f"{approx_hint}\n"
+                    + DISCLAIMER
+                )
+                return
+
+            yield event.plain_result(
+                f"📊 硬筛 {len(pairs)} 只 → 正拉取 60 日 K 线量化（耗时可较长）…"
+            )
+
+            lines, stats = await run_day_trip_full(
+                self.analyzer,
+                pairs,
+                meta,
+                max_concurrent_screen=DEFAULT_SCREENING_CONCURRENCY,
+            )
+
+            if stats.get("k_valid", 0) == 0:
+                yield event.plain_result(
+                    f"⚠️ 已对 {len(pairs)} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根）。"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc = ""
+            if len(lines) > top_n:
+                trunc = f"💡 仅展示前 {top_n} 条（分时通过共 {stats['minute_pass']} 只）。\n"
+
+            text = format_day_trip_report(
+                lines[:top_n],
+                hard_n=stats["hard_n"],
+                k_valid=stats["k_valid"],
+                top_pool=stats["top_pool"],
+                minute_pass=stats["minute_pass"],
+                trade_date=str(stats.get("trade_date", "")),
+                truncation_note=trunc,
+                volume_ratio_is_approx=vr_approx,
+                minute_fail_counts=stats.get("minute_fail_counts") or {},
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare\n请执行: pip install akshare"
+            )
+            logger.debug("股票一日游 ImportError: %s", e)
+        except Exception as e:
+            logger.error(f"股票一日游出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
     @filter.command("量化分析")
     async def quant_analysis(self, event: AstrMessageEvent, code: str = ""):
         """
@@ -3031,6 +3112,8 @@ class FundAnalyzerPlugin(Star):
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
 🔹 量化精选股票 [候选数] [输出条数] - |涨跌幅|前筛+排序（默认150/10，依赖 akshare）
+🔹 股票一日游 [展示条数] - 3%~9%且量比>1.5→综合分前20%→分时；无量比列时用成交量自建近似（报告内会说明）
+💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
 💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
 🔹 智能分析 [代码] - 🤖AI量化深度分析
@@ -3061,6 +3144,7 @@ class FundAnalyzerPlugin(Star):
   • 基金分析
   • 基金对比 161226 513100
   • 量化精选股票 150 10
+  • 股票一日游 15
   • 量化精选基金 400 10
   • 智能分析 161226
   • 股票智能分析 161226
